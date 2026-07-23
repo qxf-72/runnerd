@@ -1,0 +1,6 @@
+build/
+build-*/
+data/
+.vscode/
+.idea/
+compile_commands.json

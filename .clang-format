@@ -1,0 +1,90 @@
+BasedOnStyle: Google
+Language: Cpp
+Standard: Cpp11
+
+# 缩进风格：Google C++ 常用 2 空格
+
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+
+# 每行最大长度
+
+ColumnLimit: 100
+
+# 访问控制符缩进：
+
+# class Logger {
+
+# public:
+
+# void log();
+
+# private:
+
+# int level_;
+
+# };
+
+AccessModifierOffset: -1
+
+# 指针/引用贴近类型，工程中很常见：
+
+# const std::string& msg
+
+# Logger* logger
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# include 自动排序
+
+SortIncludes: true
+IncludeBlocks: Regroup
+
+# 大括号风格：
+
+# void func() {
+
+# if (...) {
+
+# }
+
+# }
+
+BreakBeforeBraces: Attach
+
+# namespace 内部不额外缩进
+
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+# switch-case 缩进
+
+IndentCaseLabels: true
+
+# 不允许短 if / for / while 写成一行
+
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+# 空函数可以写成一行，其余函数展开
+
+AllowShortFunctionsOnASingleLine: Empty
+
+# 参数换行时的缩进
+
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+
+# 空格细节
+
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceAfterCStyleCast: false
+
+# 注释自动整理
+
+ReflowComments: true
