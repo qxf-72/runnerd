@@ -1,22 +1,225 @@
+<div align="center">
+
 # runnerd
 
-Linux 本地任务执行守护服务。
+[English](README_EN.md) | 简体中文
 
-## 当前状态
+一个使用 C++17 编写的 Linux 本地任务执行守护服务。
 
-项目初始化阶段，核心功能尚未实现。
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B)
+![CMake](https://img.shields.io/badge/CMake-3.16%2B-064F8C?logo=cmake)
+![Platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
+![Status](https://img.shields.io/badge/status-early%20development-orange)
+[![License](https://img.shields.io/github/license/qxf-72/runnerd)](LICENSE)
 
-## 构建
+</div>
+
+`runnerd` 面向同一台 Linux 主机上的同一用户。客户端 `runnerctl`
+通过 Unix Domain Socket 与常驻服务通信；项目最终将支持任务提交、状态查询、
+取消、超时控制、输出采集和任务历史恢复。
+
+> [!IMPORTANT]
+> 项目目前处于早期开发阶段。当前版本只完成了 Unix Domain Socket
+> 通信骨架和 `PING/PONG` 链路，尚不能执行任务。
+
+## ✨ 功能特性
+
+当前已经实现：
+
+- 基于 `AF_UNIX + SOCK_STREAM` 的本地客户端/服务端通信
+- 默认监听 `/tmp/runnerd.sock`
+- `runnerctl ping` 与 `runnerd` 之间的 `PING/PONG` 通信
+- 将 socket 文件权限限制为 `0600`
+- 启动时安全处理同名路径：
+  - 已有服务正在监听时拒绝重复启动
+  - 同名路径不是 socket 时拒绝删除
+  - 失效且属于当前用户的旧 socket 会被清理
+- 正确处理短读、短写和被信号中断的系统调用
+- 使用 `SOCK_CLOEXEC` 避免文件描述符被后续程序意外继承
+- 忽略 `SIGPIPE`，避免对端断开时进程被信号终止
+- 使用 CMake 构建，并通过 CTest 注册基础 smoke test
+
+## 🏗️ 当前架构
+
+```text
+runnerctl ping
+      │
+      │ Unix Domain Socket
+      │ /tmp/runnerd.sock
+      ▼
+   runnerd
+      │
+      ├── accept 客户端连接
+      ├── 读取固定 4 字节 PING
+      └── 返回固定 4 字节 PONG
+```
+
+当前服务使用阻塞 I/O，并按顺序处理客户端。后续会将其替换为非阻塞
+I/O 和基于 `epoll` 的事件循环。
+
+## 📁 项目结构
+
+```text
+runnerd/
+├── CMakeLists.txt
+├── include/
+│   └── runnerd/
+│       └── unix_socket.h
+├── src/
+│   ├── runnerd_main.cpp
+│   ├── runnerctl_main.cpp
+│   └── unix_socket.cpp
+├── tests/
+│   └── smoke_test.cpp
+├── docs/
+│   ├── requirements.md
+│   └── state_machine.md
+├── LICENSE
+├── README.md
+└── README_EN.md
+```
+
+## 🚀 编译运行
+
+### 环境要求
+
+- Linux
+- 支持 C++17 的 GCC 或 Clang
+- CMake 3.16 或更高版本
+
+### 构建项目
 
 ```bash
+git clone https://github.com/qxf-72/runnerd.git
+cd runnerd
+
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-## 运行
+构建完成后会生成：
+
+```text
+build/
+├── runnerd
+├── runnerctl
+└── smoke_test
+```
+
+### 运行示例
+
+在第一个终端启动服务：
+
 ```bash
 ./build/runnerd
-./build/runnerctl
+```
+
+预期输出：
+
+```text
+runnerd is listening on /tmp/runnerd.sock
+```
+
+在第二个终端发送请求：
+
+```bash
+./build/runnerctl ping
+```
+
+客户端预期输出：
+
+```text
+PONG
+```
+
+服务端会同时输出：
+
+```text
+received PING
+```
+
+当前 socket 路径固定为 `/tmp/runnerd.sock`。如果服务异常退出并留下旧的
+socket 文件，下次启动时会检查该路径并安全清理失效文件。
+
+### 运行测试
+
+```bash
+cmake -E chdir build ctest --output-on-failure
+```
+
+也可以进入构建目录运行：
+
+```bash
 cd build
 ctest --output-on-failure
 ```
+
+目前只有基础 smoke test，它只验证测试目标可以成功构建和运行。
+协议单元测试和服务集成测试将在后续阶段加入。
+
+## 📡 当前协议
+
+当前协议仅用于验证最基础的通信链路：
+
+```text
+request:  "PING"  # 固定 4 字节
+response: "PONG"  # 固定 4 字节
+```
+
+Unix Domain Stream Socket 与 TCP 一样不保留消息边界。下一阶段会实现正式的
+长度前缀协议：
+
+```text
++------------------------+----------------------+
+| payload length (4 字节) | payload (变长)       |
+| 大端无符号整数          | 最大 64 KiB          |
++------------------------+----------------------+
+```
+
+## 🎯 设计边界
+
+项目最终定位为同一用户本机上的任务执行服务，明确不计划支持：
+
+- TCP 远程访问
+- 多用户登录和权限系统
+- HTTP 或 Web UI
+- 容器和 cgroup
+- 数据库和分布式 Agent
+- 线程池、任务依赖 DAG 和自动重试
+
+这些边界让项目可以集中展示 Linux 进程管理、非阻塞 I/O、事件循环和
+崩溃恢复等核心能力。
+
+## 🗺️ 路线图
+
+- [x] 初始化 CMake、CTest、需求文档和状态机文档
+- [x] 完成 Unix Domain Socket 与 `PING/PONG` 通信
+- [ ] 实现长度前缀协议和增量解码
+- [ ] 使用非阻塞 I/O 和 `epoll` 支持多个客户端
+- [ ] 实现任务提交、`fork/execve` 和 stdout/stderr 采集
+- [ ] 实现任务状态机、并发队列、取消和超时
+- [ ] 使用 journal 保存任务历史并支持重启恢复
+- [ ] 补充集成测试、Sanitizer 检查和诊断报告
+
+## 📚 文档
+
+- [需求说明](docs/requirements.md)
+- [任务状态机](docs/state_machine.md)
+
+## 🤝 Contributing
+
+欢迎提交 Issue 和 Pull Request。
+
+提交代码前，请确保项目能够完成构建和测试：
+
+```bash
+cmake --build build
+cmake -E chdir build ctest --output-on-failure
+```
+
+项目仍处于早期阶段。如果改动涉及协议、状态机或任务生命周期，建议先在
+Issue 中说明设计和行为边界。
+
+## 📄 License
+
+本项目使用 [MIT License](LICENSE)。
