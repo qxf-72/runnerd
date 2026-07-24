@@ -20,9 +20,9 @@ Socket. The project will eventually support job submission, status queries,
 cancellation, timeouts, output capture, and job history recovery.
 
 > [!IMPORTANT]
-> This project is in early development. The current version only provides the
-> Unix Domain Socket communication skeleton and a `PING/PONG` path; it cannot
-> execute jobs yet.
+> This project is in early development. The current version provides the Unix
+> Domain Socket communication skeleton, length-prefixed framing, and a
+> `PING/PONG` path; it cannot execute jobs yet.
 
 ## ✨ Features
 
@@ -31,6 +31,8 @@ Currently implemented:
 - Local client/server communication based on `AF_UNIX + SOCK_STREAM`
 - A default listening endpoint at `/tmp/runnerd.sock`
 - `PING/PONG` communication between `runnerctl ping` and `runnerd`
+- A 4-byte big-endian length prefix with a 64 KiB payload limit
+- An incremental frame decoder that handles fragmented and coalesced frames
 - Socket file permissions restricted to `0600`
 - Safe handling of an existing path on startup:
   - Refuses to start when another server is already listening
@@ -39,7 +41,7 @@ Currently implemented:
 - Correct handling of short reads, short writes, and interrupted system calls
 - `SOCK_CLOEXEC` to prevent accidental file descriptor inheritance
 - `SIGPIPE` handling so a disconnected peer does not terminate the process
-- CMake builds and a basic smoke test registered with CTest
+- CMake builds with smoke and protocol tests registered with CTest
 
 ## 🏗️ Current Architecture
 
@@ -52,13 +54,15 @@ runnerctl ping
    runnerd
       |
       |-- accept a client connection
-      |-- read the fixed 4-byte PING request
-      `-- return the fixed 4-byte PONG response
+      |-- incrementally read a length-prefixed frame
+      |-- parse the "PING" payload
+      `-- return a length-prefixed "PONG" frame
 ```
 
-The server currently uses blocking I/O and processes clients sequentially. A
-non-blocking, `epoll`-based event loop will replace this implementation in a
-later milestone.
+The server currently uses blocking I/O, processes clients sequentially, and
+handles one request per connection before closing it. A non-blocking,
+`epoll`-based event loop will replace this implementation in a later
+milestone.
 
 ## 📁 Project Structure
 
@@ -67,12 +71,15 @@ runnerd/
 |-- CMakeLists.txt
 |-- include/
 |   `-- runnerd/
+|       |-- protocol.h
 |       `-- unix_socket.h
 |-- src/
+|   |-- protocol.cpp
 |   |-- runnerd_main.cpp
 |   |-- runnerctl_main.cpp
 |   `-- unix_socket.cpp
 |-- tests/
+|   |-- protocol_test.cpp
 |   `-- smoke_test.cpp
 |-- docs/
 |   |-- requirements.md
@@ -104,6 +111,8 @@ The build produces:
 
 ```text
 build/
+|-- librunnerd_protocol.a
+|-- protocol_test
 |-- runnerd
 |-- runnerctl
 `-- smoke_test
@@ -158,21 +167,20 @@ cd build
 ctest --output-on-failure
 ```
 
-The repository currently contains one basic smoke test. It only verifies that
-the test target builds and runs successfully. Protocol unit tests and daemon
-integration tests will be added in later milestones.
+The current test suite includes:
+
+- `smoke_test`, which verifies that the basic test target builds and runs
+- `protocol_test`, which covers big-endian encoding, fragmented and coalesced
+  frames, empty and binary payloads, the 64 KiB boundary, and invalid lengths
+
+Automated client-to-daemon integration tests will be added in a later
+milestone.
 
 ## 📡 Current Protocol
 
-The current protocol only verifies the basic communication path:
-
-```text
-request:  "PING"  # fixed 4 bytes
-response: "PONG"  # fixed 4 bytes
-```
-
 Like TCP, a Unix Domain Stream Socket does not preserve message boundaries.
-The next milestone will introduce a length-prefixed protocol:
+The current protocol therefore uses a 4-byte big-endian length field to
+delimit each payload:
 
 ```text
 +--------------------------+----------------------+
@@ -180,6 +188,19 @@ The next milestone will introduce a length-prefixed protocol:
 | big-endian unsigned int  | up to 64 KiB         |
 +--------------------------+----------------------+
 ```
+
+The currently supported request and response payloads are:
+
+```text
+request:  "PING"
+response: "PONG"
+error:    "ERR!"
+```
+
+`FrameDecoder` accepts fragmented input across multiple calls and can extract
+multiple complete frames from one input buffer. Frames declaring payloads
+larger than 64 KiB are rejected. The decoder supports multiple frames, while
+the current daemon still follows a one-request-per-connection model.
 
 ## 🎯 Project Scope
 
@@ -200,7 +221,7 @@ non-blocking I/O, event loops, and honest crash recovery.
 
 - [x] Initialize CMake, CTest, requirements, and state machine documentation
 - [x] Implement Unix Domain Socket `PING/PONG` communication
-- [ ] Implement length-prefixed framing and incremental decoding
+- [x] Implement length-prefixed framing and incremental decoding
 - [ ] Support multiple clients with non-blocking I/O and `epoll`
 - [ ] Add job submission, `fork/execve`, and stdout/stderr capture
 - [ ] Add the job state machine, concurrency queue, cancellation, and timeouts

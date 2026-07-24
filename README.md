@@ -19,8 +19,8 @@
 取消、超时控制、输出采集和任务历史恢复。
 
 > [!IMPORTANT]
-> 项目目前处于早期开发阶段。当前版本只完成了 Unix Domain Socket
-> 通信骨架和 `PING/PONG` 链路，尚不能执行任务。
+> 项目目前处于早期开发阶段。当前版本完成了 Unix Domain Socket
+> 通信骨架、长度前缀协议和 `PING/PONG` 链路，尚不能执行任务。
 
 ## ✨ 功能特性
 
@@ -29,6 +29,8 @@
 - 基于 `AF_UNIX + SOCK_STREAM` 的本地客户端/服务端通信
 - 默认监听 `/tmp/runnerd.sock`
 - `runnerctl ping` 与 `runnerd` 之间的 `PING/PONG` 通信
+- 4 字节大端长度前缀，单帧 payload 最大为 64 KiB
+- 支持拆包和粘包的增量帧解码器
 - 将 socket 文件权限限制为 `0600`
 - 启动时安全处理同名路径：
   - 已有服务正在监听时拒绝重复启动
@@ -37,7 +39,7 @@
 - 正确处理短读、短写和被信号中断的系统调用
 - 使用 `SOCK_CLOEXEC` 避免文件描述符被后续程序意外继承
 - 忽略 `SIGPIPE`，避免对端断开时进程被信号终止
-- 使用 CMake 构建，并通过 CTest 注册基础 smoke test
+- 使用 CMake 构建，并通过 CTest 运行 smoke test 和协议单元测试
 
 ## 🏗️ 当前架构
 
@@ -50,12 +52,13 @@ runnerctl ping
    runnerd
       │
       ├── accept 客户端连接
-      ├── 读取固定 4 字节 PING
-      └── 返回固定 4 字节 PONG
+      ├── 增量读取长度前缀帧
+      ├── 解析 payload "PING"
+      └── 返回长度前缀帧 "PONG"
 ```
 
-当前服务使用阻塞 I/O，并按顺序处理客户端。后续会将其替换为非阻塞
-I/O 和基于 `epoll` 的事件循环。
+当前服务使用阻塞 I/O，按顺序处理客户端，并在每条连接上只处理一个请求，
+发送响应后关闭连接。后续会将其替换为非阻塞 I/O 和基于 `epoll` 的事件循环。
 
 ## 📁 项目结构
 
@@ -64,12 +67,15 @@ runnerd/
 ├── CMakeLists.txt
 ├── include/
 │   └── runnerd/
+│       ├── protocol.h
 │       └── unix_socket.h
 ├── src/
+│   ├── protocol.cpp
 │   ├── runnerd_main.cpp
 │   ├── runnerctl_main.cpp
 │   └── unix_socket.cpp
 ├── tests/
+│   ├── protocol_test.cpp
 │   └── smoke_test.cpp
 ├── docs/
 │   ├── requirements.md
@@ -101,6 +107,8 @@ cmake --build build
 
 ```text
 build/
+├── librunnerd_protocol.a
+├── protocol_test
 ├── runnerd
 ├── runnerctl
 └── smoke_test
@@ -154,20 +162,18 @@ cd build
 ctest --output-on-failure
 ```
 
-目前只有基础 smoke test，它只验证测试目标可以成功构建和运行。
-协议单元测试和服务集成测试将在后续阶段加入。
+当前测试包括：
+
+- `smoke_test`：验证基础测试目标能够成功构建和运行
+- `protocol_test`：验证大端编码、拆包、粘包、空 payload、二进制
+  payload、64 KiB 边界以及非法长度拒绝
+
+服务端到客户端的自动化集成测试将在后续阶段加入。
 
 ## 📡 当前协议
 
-当前协议仅用于验证最基础的通信链路：
-
-```text
-request:  "PING"  # 固定 4 字节
-response: "PONG"  # 固定 4 字节
-```
-
-Unix Domain Stream Socket 与 TCP 一样不保留消息边界。下一阶段会实现正式的
-长度前缀协议：
+Unix Domain Stream Socket 与 TCP 一样不保留消息边界，因此当前协议使用
+4 字节大端长度字段来界定每个 payload：
 
 ```text
 +------------------------+----------------------+
@@ -175,6 +181,18 @@ Unix Domain Stream Socket 与 TCP 一样不保留消息边界。下一阶段会�
 | 大端无符号整数          | 最大 64 KiB          |
 +------------------------+----------------------+
 ```
+
+当前请求和响应 payload 为：
+
+```text
+request:  "PING"
+response: "PONG"
+error:    "ERR!"
+```
+
+`FrameDecoder` 可以多次接收不完整数据，也可以从一次输入中依次取出多个
+完整帧。声明长度超过 64 KiB 的帧会被拒绝。解码器具备多帧解析能力，
+但当前 daemon 仍采用“一条连接、一个请求”的处理方式。
 
 ## 🎯 设计边界
 
@@ -194,7 +212,7 @@ Unix Domain Stream Socket 与 TCP 一样不保留消息边界。下一阶段会�
 
 - [x] 初始化 CMake、CTest、需求文档和状态机文档
 - [x] 完成 Unix Domain Socket 与 `PING/PONG` 通信
-- [ ] 实现长度前缀协议和增量解码
+- [x] 实现长度前缀协议和增量解码
 - [ ] 使用非阻塞 I/O 和 `epoll` 支持多个客户端
 - [ ] 实现任务提交、`fork/execve` 和 stdout/stderr 采集
 - [ ] 实现任务状态机、并发队列、取消和超时
