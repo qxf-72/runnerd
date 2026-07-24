@@ -1,7 +1,7 @@
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
@@ -9,7 +9,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <vector>
 
 #include "runnerd/protocol.h"
@@ -41,59 +40,94 @@ bool writeAll(int fd, const void* buffer, std::size_t size) {
   return true;
 }
 
-bool readFrame(int fd, runnerd::FrameDecoder& decoder, std::string& payload) {
-  std::array<char, 4096> buffer{};
+void closeClient(int epoll_fd, int client_fd) {
+  // close 本身也会让 fd 离开 epoll，但先显式删除更能表达这里的清理意图。
+  static_cast<void>(::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr));
+  ::close(client_fd);
+}
 
-  for (;;) {
-    if (decoder.hasFrame()) {
-      payload = decoder.popFrame();
-      return true;
+void acceptClients(int listen_fd, int epoll_fd) {
+  while (true) {
+    const int client_fd = ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+
+    if (client_fd == -1) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      }
+
+      if (errno == EINTR) {
+        continue;
+      }
+
+      throw std::runtime_error("accept4 failed");
     }
 
-    const ssize_t read_size = ::read(fd, buffer.data(), buffer.size());
+    try {
+      runnerd::setNonBlocking(client_fd);
 
-    if (read_size > 0) {
-      decoder.feed(buffer.data(), static_cast<std::size_t>(read_size));
-      continue;
+      epoll_event event{};
+      event.events = EPOLLIN;
+      event.data.fd = client_fd;
+
+      if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
+        throw std::runtime_error("add client to epoll failed");
+      }
+    } catch (...) {
+      ::close(client_fd);
+      throw;
     }
-
-    if (read_size == 0) {
-      return false;
-    }
-
-    if (errno == EINTR) {
-      continue;
-    }
-
-    const int saved_errno = errno;
-    throw std::system_error(saved_errno, std::generic_category(), "read request frame");
   }
 }
 
-void handleClient(int client_fd) {
+void handleClient(int client_fd, int epoll_fd) {
+  char buffer[1024];
+
   runnerd::FrameDecoder decoder;
-  std::string request;
 
-  if (!readFrame(client_fd, decoder, request)) {
-    std::cerr << "client disconnected before sending "
-              << "a complete request\n";
-    return;
-  }
+  while (true) {
+    const ssize_t n = ::read(client_fd, buffer, sizeof(buffer));
 
-  std::string response_payload;
+    if (n > 0) {
+      // 当前阶段先直接写响应；非阻塞写缓冲将在连接管理阶段实现。
+      decoder.feed(buffer, static_cast<std::size_t>(n));
 
-  if (request == "PING") {
-    std::cout << "received PING\n";
-    response_payload = "PONG";
-  } else {
-    std::cerr << "received unknown request\n";
-    response_payload = "ERR!";
-  }
+      if (!decoder.hasFrame()) {
+        continue;
+      }
 
-  const std::vector<char> response = runnerd::encodeFrame(response_payload);
+      const std::string request = decoder.popFrame();
+      std::string response_payload;
 
-  if (!writeAll(client_fd, response.data(), response.size())) {
-    std::cerr << "failed to send " << response_payload << '\n';
+      if (request == "PING") {
+        std::cout << "received PING\n";
+        response_payload = "PONG";
+      } else {
+        std::cerr << "received unknown request\n";
+        response_payload = "ERR!";
+      }
+
+      const std::vector<char> response = runnerd::encodeFrame(response_payload);
+
+      if (!writeAll(client_fd, response.data(), response.size())) {
+        std::cerr << "failed to send " << response_payload << '\n';
+        closeClient(epoll_fd, client_fd);
+        return;
+      }
+    } else if (n == 0) {
+      // 客户端已经关闭连接。
+      closeClient(epoll_fd, client_fd);
+      break;
+    } else {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      }
+
+      if (errno == EINTR) {
+        continue;
+      }
+
+      throw std::runtime_error("read client failed");
+    }
   }
 }
 
@@ -108,36 +142,63 @@ int main() {
   const std::string socket_path = "/tmp/runnerd.sock";
 
   int listen_fd = -1;
+  int epoll_fd = -1;
   bool owns_socket_path = false;
 
   try {
     listen_fd = runnerd::createUnixListener(socket_path);
     owns_socket_path = true;
+    runnerd::setNonBlocking(listen_fd);
 
     std::cout << "runnerd is listening on " << socket_path << '\n';
 
+    epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) {
+      throw std::runtime_error("epoll_create1 failed");
+    }
+
+    epoll_event listen_event{};
+    listen_event.events = EPOLLIN;
+    listen_event.data.fd = listen_fd;
+
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &listen_event) == -1) {
+      throw std::runtime_error("add listener to epoll failed");
+    }
+
     for (;;) {
-      int client_fd = -1;
+      epoll_event events[64];
+      const int count = ::epoll_wait(epoll_fd, events, 64, -1);
 
-      do {
-        client_fd = ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
-      } while (client_fd == -1 && errno == EINTR);
+      if (count == -1) {
+        if (errno == EINTR) {
+          continue;
+        }
 
-      if (client_fd == -1) {
-        throw std::runtime_error("accept4 failed");
+        throw std::runtime_error("epoll_wait failed");
       }
 
-      try {
-        handleClient(client_fd);
-      } catch (const std::exception& exception) {
-        // 单个客户端的非法数据或 I/O 错误不应终止整个服务。
-        std::cerr << "client error: " << exception.what() << '\n';
-      }
+      for (int i = 0; i < count; ++i) {
+        const int fd = events[i].data.fd;
 
-      ::close(client_fd);
+        if (fd == listen_fd) {
+          acceptClients(fd, epoll_fd);
+        } else {
+          try {
+            handleClient(fd, epoll_fd);
+          } catch (const std::exception& exception) {
+            // 单个客户端的非法数据或 I/O 错误不应终止整个服务。
+            std::cerr << "client error: " << exception.what() << '\n';
+            closeClient(epoll_fd, fd);
+          }
+        }
+      }
     }
   } catch (const std::exception& exception) {
     std::cerr << "runnerd error: " << exception.what() << '\n';
+  }
+
+  if (epoll_fd != -1) {
+    ::close(epoll_fd);
   }
 
   if (listen_fd != -1) {

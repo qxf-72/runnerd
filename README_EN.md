@@ -21,8 +21,8 @@ cancellation, timeouts, output capture, and job history recovery.
 
 > [!IMPORTANT]
 > This project is in early development. The current version provides the Unix
-> Domain Socket communication skeleton, length-prefixed framing, and a
-> `PING/PONG` path; it cannot execute jobs yet.
+> Domain Socket communication skeleton, length-prefixed framing, a `PING/PONG`
+> path, and a basic `epoll` event loop; it cannot execute jobs yet.
 
 ## ✨ Features
 
@@ -32,13 +32,16 @@ Currently implemented:
 - A default listening endpoint at `/tmp/runnerd.sock`
 - `PING/PONG` communication between `runnerctl ping` and `runnerd`
 - A 4-byte big-endian length prefix with a 64 KiB payload limit
-- An incremental frame decoder that handles fragmented and coalesced frames
+- A protocol-layer incremental decoder for fragmented and coalesced frames
+- Non-blocking listener and client sockets
+- A level-triggered `epoll` loop for listener and client readability
+- `accept` and `read` loops that continue until `EAGAIN`
 - Socket file permissions restricted to `0600`
 - Safe handling of an existing path on startup:
   - Refuses to start when another server is already listening
   - Refuses to remove a path that is not a socket
   - Removes a stale socket owned by the current user
-- Correct handling of short reads, short writes, and interrupted system calls
+- Retries for interrupted `accept`, `read`, and `write` calls
 - `SOCK_CLOEXEC` to prevent accidental file descriptor inheritance
 - `SIGPIPE` handling so a disconnected peer does not terminate the process
 - CMake builds with smoke and protocol tests registered with CTest
@@ -53,15 +56,20 @@ runnerctl ping
       v
    runnerd
       |
-      |-- accept a client connection
-      |-- incrementally read a length-prefixed frame
-      |-- parse the "PING" payload
-      `-- return a length-prefixed "PONG" frame
+      `-- epoll_wait
+            |-- readable listen fd
+            |     `-- accept until EAGAIN
+            `-- readable client fd
+                  `-- read until EAGAIN
+                        |-- parse the "PING" payload
+                        `-- directly write a framed "PONG"
 ```
 
-The server currently uses blocking I/O, processes clients sequentially, and
-handles one request per connection before closing it. A non-blocking,
-`epoll`-based event loop will replace this implementation in a later
+The current implementation is a basic level-triggered `epoll` loop. Listener
+and client file descriptors are non-blocking, but per-connection decoder state
+is not stored yet and responses are still written directly. Fragmented frames
+that span multiple `epoll` events and writes that need to resume after
+`EAGAIN` will be handled by the next connection-management and output-buffer
 milestone.
 
 ## 📁 Project Structure
@@ -199,8 +207,9 @@ error:    "ERR!"
 
 `FrameDecoder` accepts fragmented input across multiple calls and can extract
 multiple complete frames from one input buffer. Frames declaring payloads
-larger than 64 KiB are rejected. The decoder supports multiple frames, while
-the current daemon still follows a one-request-per-connection model.
+larger than 64 KiB are rejected. The daemon does not yet retain a decoder for
+each connection, so it currently handles only request frames completed during
+one readable-event handling pass reliably.
 
 ## 🎯 Project Scope
 
@@ -222,7 +231,8 @@ non-blocking I/O, event loops, and honest crash recovery.
 - [x] Initialize CMake, CTest, requirements, and state machine documentation
 - [x] Implement Unix Domain Socket `PING/PONG` communication
 - [x] Implement length-prefixed framing and incremental decoding
-- [ ] Support multiple clients with non-blocking I/O and `epoll`
+- [ ] Support multiple clients with non-blocking I/O and `epoll` (basic event
+  loop complete; connection state and output buffering remain)
 - [ ] Add job submission, `fork/execve`, and stdout/stderr capture
 - [ ] Add the job state machine, concurrency queue, cancellation, and timeouts
 - [ ] Persist job history in a journal and recover it after restart

@@ -17,7 +17,11 @@ int createUnixListener(const std::string& socket_path);
 // 失败：抛出 std::runtime_error。
 int connectUnixSocket(const std::string& socket_path);
 
-}  // namespace runnerd
+// 保留 fd 的其他状态标志，并将其切换为非阻塞模式。
+// 成功：返回原文件描述符。
+// 失败：抛出 std::runtime_error。
+int setNonBlocking(int fd);
 
+}  // namespace runnerd
 
 #endif
