@@ -21,8 +21,9 @@ cancellation, timeouts, output capture, and job history recovery.
 
 > [!IMPORTANT]
 > This project is in early development. The current version provides the Unix
-> Domain Socket communication skeleton, length-prefixed framing, a `PING/PONG`
-> path, and a basic `epoll` event loop; it cannot execute jobs yet.
+> Domain Socket transport, length-prefixed framing, a `PING/PONG` path, and an
+> `epoll` event loop with per-connection state and non-blocking output
+> buffering; it cannot execute jobs yet.
 
 ## ✨ Features
 
@@ -34,8 +35,14 @@ Currently implemented:
 - A 4-byte big-endian length prefix with a 64 KiB payload limit
 - A protocol-layer incremental decoder for fragmented and coalesced frames
 - Non-blocking listener and client sockets
-- A level-triggered `epoll` loop for listener and client readability
-- `accept` and `read` loops that continue until `EAGAIN`
+- A level-triggered `epoll` loop for the listener and multiple client fds
+- Per-connection decoder state, output buffering, and write offsets
+- Incomplete frames retained across `epoll` events and all complete frames
+  processed from each read
+- `accept` and `read` loops that continue until `EAGAIN`; writes continue
+  until the output buffer is drained or `EAGAIN` is returned
+- `EPOLLOUT` enabled only while output is pending, with partial-write resumption
+- Pending responses flushed before closing a peer-half-closed connection
 - Socket file permissions restricted to `0600`
 - Safe handling of an existing path on startup:
   - Refuses to start when another server is already listening
@@ -59,18 +66,26 @@ runnerctl ping
       `-- epoll_wait
             |-- readable listen fd
             |     `-- accept until EAGAIN
-            `-- readable client fd
-                  `-- read until EAGAIN
-                        |-- parse the "PING" payload
-                        `-- directly write a framed "PONG"
+            `-- client fd
+                  |-- Connection
+                  |     |-- FrameDecoder
+                  |     |-- output buffer
+                  |     |-- write offset
+                  |     `-- read closed
+                  |-- EPOLLIN
+                  |     `-- read -> decode -> queue response
+                  |-- EPOLLOUT
+                  |     `-- resume from the write offset
+                  `-- EPOLLRDHUP
+                        `-- drain final input -> flush output -> close
 ```
 
-The current implementation is a basic level-triggered `epoll` loop. Listener
-and client file descriptors are non-blocking, but per-connection decoder state
-is not stored yet and responses are still written directly. Fragmented frames
-that span multiple `epoll` events and writes that need to resume after
-`EAGAIN` will be handled by the next connection-management and output-buffer
-milestone.
+The server stores connection state by file descriptor in a `Connections` map.
+Reads continue until `EAGAIN`; complete requests are decoded and their
+responses are appended to the output buffer. `EPOLLOUT` is registered only
+while output is pending. A partial write resumes from its saved offset on the
+next writable event, and `EPOLLOUT` is removed once the buffer is drained to
+avoid a busy loop.
 
 ## 📁 Project Structure
 
@@ -202,14 +217,16 @@ The currently supported request and response payloads are:
 ```text
 request:  "PING"
 response: "PONG"
-error:    "ERR!"
+unknown request response: "ERR!"
 ```
 
 `FrameDecoder` accepts fragmented input across multiple calls and can extract
 multiple complete frames from one input buffer. Frames declaring payloads
-larger than 64 KiB are rejected. The daemon does not yet retain a decoder for
-each connection, so it currently handles only request frames completed during
-one readable-event handling pass reliably.
+larger than 64 KiB are rejected. The daemon retains an independent decoder for
+each client, so a request may span multiple reads and multiple `epoll` events.
+Multiple complete requests received together are processed in order and each
+produces a response. Unknown requests receive `ERR!`; malformed or oversized
+frames cause the server to close the corresponding client connection.
 
 ## 🎯 Project Scope
 
@@ -231,8 +248,8 @@ non-blocking I/O, event loops, and honest crash recovery.
 - [x] Initialize CMake, CTest, requirements, and state machine documentation
 - [x] Implement Unix Domain Socket `PING/PONG` communication
 - [x] Implement length-prefixed framing and incremental decoding
-- [ ] Support multiple clients with non-blocking I/O and `epoll` (basic event
-  loop complete; connection state and output buffering remain)
+- [x] Support multiple clients with non-blocking I/O, connection state, output
+  buffering, and `epoll`
 - [ ] Add job submission, `fork/execve`, and stdout/stderr capture
 - [ ] Add the job state machine, concurrency queue, cancellation, and timeouts
 - [ ] Persist job history in a journal and recover it after restart

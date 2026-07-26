@@ -20,8 +20,8 @@
 
 > [!IMPORTANT]
 > 项目目前处于早期开发阶段。当前版本完成了 Unix Domain Socket
-> 通信骨架、长度前缀协议、`PING/PONG` 链路和基础 `epoll` 事件循环，
-> 尚不能执行任务。
+> 通信、长度前缀协议、`PING/PONG` 链路，以及带有连接状态和非阻塞
+> 写缓冲的 `epoll` 事件循环，尚不能执行任务。
 
 ## ✨ 功能特性
 
@@ -33,8 +33,13 @@
 - 4 字节大端长度前缀，单帧 payload 最大为 64 KiB
 - 协议层提供支持拆包和粘包的增量帧解码器
 - 将监听 socket 和客户端 socket 设置为非阻塞模式
-- 使用 LT（水平触发）`epoll` 监听连接和客户端可读事件
-- 在 `accept` 和 `read` 中持续处理，直到返回 `EAGAIN`
+- 使用 LT（水平触发）`epoll` 管理监听 fd 和多个客户端 fd
+- 为每个连接保存独立的解码器、写缓冲和写入偏移
+- 跨多次 `epoll` 事件保留不完整帧，并依次处理一次读取中的多个完整帧
+- `accept` 和 `read` 持续到 `EAGAIN`；`write` 持续到缓冲区清空或
+  返回 `EAGAIN`
+- 仅在存在待写数据时监听 `EPOLLOUT`，支持部分写入后继续发送
+- 对端半关闭发送方向后，先发送完已经排队的响应再关闭连接
 - 将 socket 文件权限限制为 `0600`
 - 启动时安全处理同名路径：
   - 已有服务正在监听时拒绝重复启动
@@ -58,16 +63,24 @@ runnerctl ping
       └── epoll_wait
             ├── listen fd 可读
             │     └── accept，直到 EAGAIN
-            └── client fd 可读
-                  └── read，直到 EAGAIN
-                        ├── 解析 payload "PING"
-                        └── 直接返回长度前缀帧 "PONG"
+            └── client fd
+                  ├── Connection
+                  │     ├── FrameDecoder
+                  │     ├── write buffer
+                  │     ├── write offset
+                  │     └── read closed
+                  ├── EPOLLIN
+                  │     └── read → 解码请求 → 响应入队
+                  ├── EPOLLOUT
+                  │     └── 从 write offset 继续发送
+                  └── EPOLLRDHUP
+                        └── 读完最后输入 → 排空待写响应 → 关闭
 ```
 
-当前完成的是 LT `epoll` 基础事件循环。监听和客户端 fd 已经使用非阻塞
-I/O，但还没有保存每条连接的解码状态，响应也暂时直接调用 `write`。因此，
-跨越两次 `epoll` 事件的拆包，以及写入返回 `EAGAIN` 后的续写，仍将在下一步
-连接管理和写缓冲中实现。
+服务端使用 `Connections` 表按 fd 保存连接状态。读取时持续调用 `read`
+直到 `EAGAIN`，完整请求会被解析并将响应追加到写缓冲；存在待写数据时才
+注册 `EPOLLOUT`。如果 `write` 只发送了一部分，下一次可写事件会从保存的
+偏移继续发送，缓冲区清空后取消 `EPOLLOUT`，避免事件循环空转。
 
 ## 📁 项目结构
 
@@ -196,13 +209,14 @@ Unix Domain Stream Socket 与 TCP 一样不保留消息边界，因此当前协�
 ```text
 request:  "PING"
 response: "PONG"
-error:    "ERR!"
+unknown request response: "ERR!"
 ```
 
-`FrameDecoder` 本身可以多次接收不完整数据，也可以从一次输入中依次取出
-多个完整帧。声明长度超过 64 KiB 的帧会被拒绝。当前 daemon 尚未为每条
-连接持久保存一个解码器，因此现阶段只能可靠处理在一次可读事件处理期间
-收完整的请求帧。
+`FrameDecoder` 可以多次接收不完整数据，也可以从一次输入中依次取出多个
+完整帧。声明长度超过 64 KiB 的帧会被拒绝。daemon 为每条客户端连接保存
+独立的解码器，因此请求帧可以跨越多次 `read` 和多次 `epoll` 事件到达；
+同一次读取中的多个完整请求也会被依次处理并生成响应。未知请求会收到
+`ERR!`；非法或超长帧会导致服务端关闭对应的客户端连接。
 
 ## 🎯 设计边界
 
@@ -223,8 +237,7 @@ error:    "ERR!"
 - [x] 初始化 CMake、CTest、需求文档和状态机文档
 - [x] 完成 Unix Domain Socket 与 `PING/PONG` 通信
 - [x] 实现长度前缀协议和增量解码
-- [ ] 使用非阻塞 I/O 和 `epoll` 支持多个客户端（基础事件循环已完成，
-  连接状态和写缓冲待实现）
+- [x] 使用非阻塞 I/O、连接状态、写缓冲和 `epoll` 支持多个客户端
 - [ ] 实现任务提交、`fork/execve` 和 stdout/stderr 采集
 - [ ] 实现任务状态机、并发队列、取消和超时
 - [ ] 使用 journal 保存任务历史并支持重启恢复
