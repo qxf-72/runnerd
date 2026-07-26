@@ -28,7 +28,7 @@
 当前已经实现：
 
 - 基于 `AF_UNIX + SOCK_STREAM` 的本地客户端/服务端通信
-- 默认监听 `/tmp/runnerd.sock`
+- 默认监听 `/tmp/runnerd.sock`，也可以通过 `--socket <path>` 指定路径
 - `runnerctl ping` 与 `runnerd` 之间的 `PING/PONG` 通信
 - 4 字节大端长度前缀，单帧 payload 最大为 64 KiB
 - 协议层提供支持拆包和粘包的增量帧解码器
@@ -56,7 +56,7 @@
 runnerctl ping
       │
       │ Unix Domain Socket
-      │ /tmp/runnerd.sock
+      │ /tmp/runnerd.sock（默认）
       ▼
    runnerd
       │
@@ -138,6 +138,13 @@ build/
 
 ### 运行示例
 
+命令格式：
+
+```text
+runnerd [--socket <path>]
+runnerctl [--socket <path>] ping
+```
+
 在第一个终端启动服务：
 
 ```bash
@@ -168,8 +175,16 @@ PONG
 received PING
 ```
 
-当前 socket 路径固定为 `/tmp/runnerd.sock`。如果服务异常退出并留下旧的
-socket 文件，下次启动时会检查该路径并安全清理失效文件。
+省略 `--socket` 时，两个程序都使用 `/tmp/runnerd.sock`。如需指定其他
+路径，服务端和客户端必须使用相同的参数：
+
+```bash
+./build/runnerd --socket /tmp/runnerd-demo.sock
+./build/runnerctl --socket /tmp/runnerd-demo.sock ping
+```
+
+如果服务异常退出并留下旧的 socket 文件，下次使用相同路径启动时会检查并
+安全清理失效文件。
 
 ### 运行测试
 

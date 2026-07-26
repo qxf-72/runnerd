@@ -30,7 +30,8 @@ cancellation, timeouts, output capture, and job history recovery.
 Currently implemented:
 
 - Local client/server communication based on `AF_UNIX + SOCK_STREAM`
-- A default listening endpoint at `/tmp/runnerd.sock`
+- A default endpoint at `/tmp/runnerd.sock`, configurable with
+  `--socket <path>`
 - `PING/PONG` communication between `runnerctl ping` and `runnerd`
 - A 4-byte big-endian length prefix with a 64 KiB payload limit
 - A protocol-layer incremental decoder for fragmented and coalesced frames
@@ -59,7 +60,7 @@ Currently implemented:
 runnerctl ping
       |
       | Unix Domain Socket
-      | /tmp/runnerd.sock
+      | /tmp/runnerd.sock (default)
       v
    runnerd
       |
@@ -143,6 +144,13 @@ build/
 
 ### Run the Example
 
+Command syntax:
+
+```text
+runnerd [--socket <path>]
+runnerctl [--socket <path>] ping
+```
+
 Start the server in the first terminal:
 
 ```bash
@@ -173,9 +181,16 @@ The server also prints:
 received PING
 ```
 
-The socket path is currently fixed at `/tmp/runnerd.sock`. If the server exits
-abnormally and leaves a stale socket file behind, the next startup checks the
-path and safely removes the stale file.
+Both programs use `/tmp/runnerd.sock` when `--socket` is omitted. To use a
+different path, pass the same option to the server and client:
+
+```bash
+./build/runnerd --socket /tmp/runnerd-demo.sock
+./build/runnerctl --socket /tmp/runnerd-demo.sock ping
+```
+
+If the server exits abnormally and leaves a stale socket file behind, the next
+startup using the same path checks and safely removes it.
 
 ### Run the Tests
 

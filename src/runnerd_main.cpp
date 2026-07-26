@@ -18,6 +18,24 @@
 
 namespace {
 
+constexpr const char* kDefaultSocketPath = "/tmp/runnerd.sock";
+
+bool parseCommandLine(int argc, char* argv[], std::string& socket_path) {
+  socket_path = kDefaultSocketPath;
+
+  if (argc == 1) {
+    return true;
+  }
+
+  if (argc == 3 && std::string(argv[1]) == "--socket" &&
+      argv[2][0] != '\0') {
+    socket_path = argv[2];
+    return true;
+  }
+
+  return false;
+}
+
 // 连接状态
 struct Connection {
   // 每个连接独立保存解码器，使不完整帧可以跨多次 epoll 事件继续接收。
@@ -187,13 +205,18 @@ bool handleClientRead(int client_fd, Connection& connection) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
+  std::string socket_path;
+
+  if (!parseCommandLine(argc, argv, socket_path)) {
+    std::cerr << "Usage: " << argv[0] << " [--socket <path>]\n";
+    return 1;
+  }
+
   // 客户端提前断开连接时，
   // write 可能触发 SIGPIPE。
   // 忽略 SIGPIPE，让 write 返回错误即可。
   std::signal(SIGPIPE, SIG_IGN);
-
-  const std::string socket_path = "/tmp/runnerd.sock";
 
   int listen_fd = -1;
   int epoll_fd = -1;

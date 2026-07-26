@@ -15,6 +15,24 @@
 
 namespace {
 
+constexpr const char* kDefaultSocketPath = "/tmp/runnerd.sock";
+
+bool parseCommandLine(int argc, char* argv[], std::string& socket_path) {
+  socket_path = kDefaultSocketPath;
+
+  if (argc == 2 && std::string(argv[1]) == "ping") {
+    return true;
+  }
+
+  if (argc == 4 && std::string(argv[1]) == "--socket" && argv[2][0] != '\0' &&
+      std::string(argv[3]) == "ping") {
+    socket_path = argv[2];
+    return true;
+  }
+
+  return false;
+}
+
 bool writeAll(int fd, const void* buffer, std::size_t size) {
   const auto* data = static_cast<const char*>(buffer);
   std::size_t total_written = 0;
@@ -69,14 +87,15 @@ bool readFrame(int fd, runnerd::FrameDecoder& decoder, std::string& payload) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  std::signal(SIGPIPE, SIG_IGN);
+  std::string socket_path;
 
-  if (argc != 2 || std::string(argv[1]) != "ping") {
-    std::cerr << "Usage: " << argv[0] << " ping\n";
+  if (!parseCommandLine(argc, argv, socket_path)) {
+    std::cerr << "Usage: " << argv[0] << " [--socket <path>] ping\n";
     return 1;
   }
 
-  const std::string socket_path = "/tmp/runnerd.sock";
+  std::signal(SIGPIPE, SIG_IGN);
+
   int socket_fd = -1;
 
   try {
