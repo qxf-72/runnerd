@@ -23,7 +23,9 @@ cancellation, timeouts, output capture, and job history recovery.
 > This project is in early development. The current version provides the Unix
 > Domain Socket transport, length-prefixed framing, a `PING/PONG` path, and an
 > `epoll` event loop with per-connection state and non-blocking output
-> buffering; it cannot execute jobs yet.
+> buffering. It also defines the job data model, validation rules, and state
+> transitions. The model is not connected to the daemon or wire protocol yet,
+> so jobs still cannot be submitted or executed.
 
 ## ✨ Features
 
@@ -52,8 +54,13 @@ Currently implemented:
 - Retries for interrupted `accept`, `read`, and `write` calls
 - `SOCK_CLOEXEC` to prevent accidental file descriptor inheritance
 - `SIGPIPE` handling so a disconnected peer does not terminate the process
-- CMake builds with smoke, protocol, and multi-client integration tests
-  registered with CTest
+- `JobId`, `JobSpec`, `Job`, and eight `JobState` values for identity,
+  arguments, runtime state, process metadata, and exit results
+- Validation for missing commands, embedded NUL bytes, and non-positive
+  configured timeouts
+- Centralized checks for all ten legal state transitions and terminal states
+- CMake builds with smoke, protocol, job model, and multi-client integration
+  tests registered with CTest
 
 ## 🏗️ Current Architecture
 
@@ -89,6 +96,25 @@ while output is pending. A partial write resumes from its saved offset on the
 next writable event, and `EPOLLOUT` is removed once the buffer is drained to
 avoid a busy loop.
 
+The job model currently lives in a standalone `runnerd_job` static library:
+
+```text
+JobSpec
+   |
+   `-- validateJobSpec
+           |
+           v
+      Job (initial state: QUEUED)
+           |
+           |-- canTransition: validate a state change
+           |-- transitionJob: apply a legal state change
+           `-- isTerminal: determine whether the job has finished
+```
+
+This model has unit-test coverage but is not linked into the `runnerd` event
+loop yet. The daemon will begin using it when job submission and process
+management are implemented.
+
 ## 📁 Project Structure
 
 ```text
@@ -96,14 +122,17 @@ runnerd/
 |-- CMakeLists.txt
 |-- include/
 |   `-- runnerd/
+|       |-- job.h
 |       |-- protocol.h
 |       `-- unix_socket.h
 |-- src/
+|   |-- job.cpp
 |   |-- protocol.cpp
 |   |-- runnerd_main.cpp
 |   |-- runnerctl_main.cpp
 |   `-- unix_socket.cpp
 |-- tests/
+|   |-- job_test.cpp
 |   |-- protocol_test.cpp
 |   |-- runnerd_integration_test.sh
 |   `-- smoke_test.cpp
@@ -137,7 +166,9 @@ The build produces:
 
 ```text
 build/
+|-- librunnerd_job.a
 |-- librunnerd_protocol.a
+|-- job_test
 |-- protocol_test
 |-- runnerd
 |-- runnerctl
@@ -212,6 +243,9 @@ The current test suite includes:
 - `smoke_test`, which verifies that the basic test target builds and runs
 - `protocol_test`, which covers big-endian encoding, fragmented and coalesced
   frames, empty and binary payloads, the 64 KiB boundary, and invalid lengths
+- `job_test`, which covers valid and invalid job specifications, every legal
+  state transition, representative invalid transitions, and terminal-state
+  detection
 - `runnerd_integration_test`, which starts a real daemon on an isolated
   temporary socket, runs 20 `runnerctl ping` processes concurrently, and
   verifies that every client prints `PONG`
@@ -270,8 +304,10 @@ non-blocking I/O, event loops, and honest crash recovery.
 - [x] Implement length-prefixed framing and incremental decoding
 - [x] Support multiple clients with non-blocking I/O, connection state, output
   buffering, and `epoll`
+- [x] Define the job model, validation, state-transition rules, and unit tests
 - [ ] Add job submission, `fork/execve`, and stdout/stderr capture
-- [ ] Add the job state machine, concurrency queue, cancellation, and timeouts
+- [ ] Connect the job model to the daemon and add the concurrency queue,
+  cancellation, and timeouts
 - [ ] Persist job history in a journal and recover it after restart
 - [ ] Add more failure-path integration tests, Sanitizer checks, and
   diagnostic reports

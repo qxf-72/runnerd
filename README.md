@@ -21,7 +21,9 @@
 > [!IMPORTANT]
 > 项目目前处于早期开发阶段。当前版本完成了 Unix Domain Socket
 > 通信、长度前缀协议、`PING/PONG` 链路，以及带有连接状态和非阻塞
-> 写缓冲的 `epoll` 事件循环，尚不能执行任务。
+> 写缓冲的 `epoll` 事件循环；同时已经定义任务数据模型、参数校验和
+> 状态迁移规则。任务模型尚未接入 daemon 和通信协议，因此目前仍不能
+> 提交或执行任务。
 
 ## ✨ 功能特性
 
@@ -48,8 +50,12 @@
 - 对被信号中断的 `accept`、`read` 和 `write` 进行重试
 - 使用 `SOCK_CLOEXEC` 避免文件描述符被后续程序意外继承
 - 忽略 `SIGPIPE`，避免对端断开时进程被信号终止
-- 使用 CMake 构建，并通过 CTest 运行 smoke test、协议单元测试和
-  多客户端集成测试
+- 定义 `JobId`、`JobSpec`、`Job` 和 8 种 `JobState`，保存任务标识、
+  执行参数、运行状态、进程信息和退出结果
+- 校验任务命令不能为空、参数不能包含 NUL 字节，并要求已设置的超时为正数
+- 集中检查 10 条合法状态迁移，并提供终态判断
+- 使用 CMake 构建，并通过 CTest 运行 smoke test、协议单元测试、
+  任务模型单元测试和多客户端集成测试
 
 ## 🏗️ 当前架构
 
@@ -83,6 +89,24 @@ runnerctl ping
 注册 `EPOLLOUT`。如果 `write` 只发送了一部分，下一次可写事件会从保存的
 偏移继续发送，缓冲区清空后取消 `EPOLLOUT`，避免事件循环空转。
 
+任务模型目前作为独立的 `runnerd_job` 静态库存在：
+
+```text
+JobSpec
+   │
+   └── validateJobSpec
+           │
+           ▼
+      Job（初始状态 QUEUED）
+           │
+           ├── canTransition：检查迁移是否合法
+           ├── transitionJob：执行合法迁移
+           └── isTerminal：判断任务是否已经结束
+```
+
+这一模型已经完成单元测试，但尚未链接到 `runnerd` 的事件循环。后续实现任务
+提交和进程管理时，daemon 才会用它记录真实任务。
+
 ## 📁 项目结构
 
 ```text
@@ -90,14 +114,17 @@ runnerd/
 ├── CMakeLists.txt
 ├── include/
 │   └── runnerd/
+│       ├── job.h
 │       ├── protocol.h
 │       └── unix_socket.h
 ├── src/
+│   ├── job.cpp
 │   ├── protocol.cpp
 │   ├── runnerd_main.cpp
 │   ├── runnerctl_main.cpp
 │   └── unix_socket.cpp
 ├── tests/
+│   ├── job_test.cpp
 │   ├── protocol_test.cpp
 │   ├── runnerd_integration_test.sh
 │   └── smoke_test.cpp
@@ -131,7 +158,9 @@ cmake --build build
 
 ```text
 build/
+├── librunnerd_job.a
 ├── librunnerd_protocol.a
+├── job_test
 ├── protocol_test
 ├── runnerd
 ├── runnerctl
@@ -206,6 +235,8 @@ ctest --output-on-failure
 - `smoke_test`：验证基础测试目标能够成功构建和运行
 - `protocol_test`：验证大端编码、拆包、粘包、空 payload、二进制
   payload、64 KiB 边界以及非法长度拒绝
+- `job_test`：验证合法和非法任务参数、全部合法状态迁移、典型非法迁移，
+  以及终态判断
 - `runnerd_integration_test`：使用独立临时 socket 启动真实 daemon，
   并发运行 20 个 `runnerctl ping`，验证每个客户端都成功输出 `PONG`
 
@@ -257,8 +288,9 @@ unknown request response: "ERR!"
 - [x] 完成 Unix Domain Socket 与 `PING/PONG` 通信
 - [x] 实现长度前缀协议和增量解码
 - [x] 使用非阻塞 I/O、连接状态、写缓冲和 `epoll` 支持多个客户端
+- [x] 定义任务数据模型、参数校验、状态迁移规则和对应单元测试
 - [ ] 实现任务提交、`fork/execve` 和 stdout/stderr 采集
-- [ ] 实现任务状态机、并发队列、取消和超时
+- [ ] 将任务模型接入 daemon，实现并发队列、取消和超时
 - [ ] 使用 journal 保存任务历史并支持重启恢复
 - [ ] 补充更多异常场景集成测试、Sanitizer 检查和诊断报告
 
