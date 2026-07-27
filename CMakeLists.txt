@@ -10,6 +10,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 生成 compile_commands.json，供 clangd 获取项目的真实编译参数。
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 add_library(runnerd_protocol STATIC
     src/protocol.cpp
 )
@@ -23,6 +26,21 @@ target_compile_options(runnerd_protocol PRIVATE
     -Wextra
     -Wpedantic
 )
+
+add_library(runnerd_job STATIC
+    src/job.cpp
+)
+
+target_include_directories(runnerd_job PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_options(runnerd_job PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
 
 add_executable(runnerd
     src/runnerd_main.cpp
@@ -103,12 +121,31 @@ add_test(
     COMMAND protocol_test
 )
 
+add_executable(job_test
+    tests/job_test.cpp
+)
+
+target_link_libraries(job_test PRIVATE
+    runnerd_job
+)
+
+target_compile_options(job_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(
+    NAME job_test
+    COMMAND job_test
+)
+
 add_test(
     NAME runnerd_integration_test
     COMMAND bash
-        ${PROJECT_SOURCE_DIR}/tests/runnerd_integration_test.sh
-        $<TARGET_FILE:runnerd>
-        $<TARGET_FILE:runnerctl>
+    ${PROJECT_SOURCE_DIR}/tests/runnerd_integration_test.sh
+    $<TARGET_FILE:runnerd>
+    $<TARGET_FILE:runnerctl>
 )
 
 # 防止服务端或客户端异常时让 CTest 一直等待。
