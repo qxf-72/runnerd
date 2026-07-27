@@ -102,3 +102,16 @@ add_test(
     NAME protocol_test
     COMMAND protocol_test
 )
+
+add_test(
+    NAME runnerd_integration_test
+    COMMAND bash
+        ${PROJECT_SOURCE_DIR}/tests/runnerd_integration_test.sh
+        $<TARGET_FILE:runnerd>
+        $<TARGET_FILE:runnerctl>
+)
+
+# 防止服务端或客户端异常时让 CTest 一直等待。
+set_tests_properties(runnerd_integration_test PROPERTIES
+    TIMEOUT 10
+)

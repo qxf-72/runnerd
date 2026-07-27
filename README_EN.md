@@ -52,7 +52,8 @@ Currently implemented:
 - Retries for interrupted `accept`, `read`, and `write` calls
 - `SOCK_CLOEXEC` to prevent accidental file descriptor inheritance
 - `SIGPIPE` handling so a disconnected peer does not terminate the process
-- CMake builds with smoke and protocol tests registered with CTest
+- CMake builds with smoke, protocol, and multi-client integration tests
+  registered with CTest
 
 ## 🏗️ Current Architecture
 
@@ -104,6 +105,7 @@ runnerd/
 |   `-- unix_socket.cpp
 |-- tests/
 |   |-- protocol_test.cpp
+|   |-- runnerd_integration_test.sh
 |   `-- smoke_test.cpp
 |-- docs/
 |   |-- requirements.md
@@ -210,9 +212,12 @@ The current test suite includes:
 - `smoke_test`, which verifies that the basic test target builds and runs
 - `protocol_test`, which covers big-endian encoding, fragmented and coalesced
   frames, empty and binary payloads, the 64 KiB boundary, and invalid lengths
+- `runnerd_integration_test`, which starts a real daemon on an isolated
+  temporary socket, runs 20 `runnerctl ping` processes concurrently, and
+  verifies that every client prints `PONG`
 
-Automated client-to-daemon integration tests will be added in a later
-milestone.
+Additional integration coverage for cross-event fragmentation, half-closes,
+and partial writes will be added in a later milestone.
 
 ## 📡 Current Protocol
 
@@ -268,7 +273,8 @@ non-blocking I/O, event loops, and honest crash recovery.
 - [ ] Add job submission, `fork/execve`, and stdout/stderr capture
 - [ ] Add the job state machine, concurrency queue, cancellation, and timeouts
 - [ ] Persist job history in a journal and recover it after restart
-- [ ] Add integration tests, Sanitizer checks, and diagnostic reports
+- [ ] Add more failure-path integration tests, Sanitizer checks, and
+  diagnostic reports
 
 ## 📚 Documentation
 

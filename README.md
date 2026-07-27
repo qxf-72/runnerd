@@ -48,7 +48,8 @@
 - 对被信号中断的 `accept`、`read` 和 `write` 进行重试
 - 使用 `SOCK_CLOEXEC` 避免文件描述符被后续程序意外继承
 - 忽略 `SIGPIPE`，避免对端断开时进程被信号终止
-- 使用 CMake 构建，并通过 CTest 运行 smoke test 和协议单元测试
+- 使用 CMake 构建，并通过 CTest 运行 smoke test、协议单元测试和
+  多客户端集成测试
 
 ## 🏗️ 当前架构
 
@@ -98,6 +99,7 @@ runnerd/
 │   └── unix_socket.cpp
 ├── tests/
 │   ├── protocol_test.cpp
+│   ├── runnerd_integration_test.sh
 │   └── smoke_test.cpp
 ├── docs/
 │   ├── requirements.md
@@ -204,8 +206,10 @@ ctest --output-on-failure
 - `smoke_test`：验证基础测试目标能够成功构建和运行
 - `protocol_test`：验证大端编码、拆包、粘包、空 payload、二进制
   payload、64 KiB 边界以及非法长度拒绝
+- `runnerd_integration_test`：使用独立临时 socket 启动真实 daemon，
+  并发运行 20 个 `runnerctl ping`，验证每个客户端都成功输出 `PONG`
 
-服务端到客户端的自动化集成测试将在后续阶段加入。
+跨事件拆包、半关闭和部分写入等异常场景的集成测试将在后续阶段继续补充。
 
 ## 📡 当前协议
 
@@ -256,7 +260,7 @@ unknown request response: "ERR!"
 - [ ] 实现任务提交、`fork/execve` 和 stdout/stderr 采集
 - [ ] 实现任务状态机、并发队列、取消和超时
 - [ ] 使用 journal 保存任务历史并支持重启恢复
-- [ ] 补充集成测试、Sanitizer 检查和诊断报告
+- [ ] 补充更多异常场景集成测试、Sanitizer 检查和诊断报告
 
 ## 📚 文档
 
