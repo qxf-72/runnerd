@@ -56,6 +56,18 @@ void testInvalidJobSpecs() {
       [&empty_program]() { runnerd::validateJobSpec(empty_program); },
       "job with empty argv[0] was accepted");
 
+  runnerd::JobSpec program_name_only;
+  program_name_only.argv = {"echo", "hello"};
+  expectThrows<std::invalid_argument>(
+      [&program_name_only]() { runnerd::validateJobSpec(program_name_only); },
+      "job with a program name instead of an absolute path was accepted");
+
+  runnerd::JobSpec relative_program;
+  relative_program.argv = {"./echo", "hello"};
+  expectThrows<std::invalid_argument>(
+      [&relative_program]() { runnerd::validateJobSpec(relative_program); },
+      "job with a relative executable path was accepted");
+
   runnerd::JobSpec nul_argument;
   nul_argument.argv = {"/bin/echo", std::string("hel\0lo", 6)};
   expectThrows<std::invalid_argument>([&nul_argument]() { runnerd::validateJobSpec(nul_argument); },

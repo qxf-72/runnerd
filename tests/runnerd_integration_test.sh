@@ -121,4 +121,85 @@ if [[ $test_failed -ne 0 ]]; then
   exit 1
 fi
 
+# 第一次提交：没有超时，应分配 JobId 1。
+submit_one_error="$test_dir/submit-1.err"
+
+if ! first_job_id=$(
+  "$runnerctl_path" \
+    --socket "$socket_path" \
+    submit -- /bin/echo hello \
+    2>"$submit_one_error"
+); then
+  echo "first job submission failed" >&2
+  sed -n '1,40p' "$submit_one_error" >&2
+  exit 1
+fi
+
+if [[ "$first_job_id" != "1" ]]; then
+  echo \
+    "first submission returned '$first_job_id', expected '1'" \
+    >&2
+  exit 1
+fi
+
+# 第二次提交：正数超时应正确往返。
+submit_two_error="$test_dir/submit-2.err"
+
+if ! second_job_id=$(
+  "$runnerctl_path" \
+    --socket "$socket_path" \
+    submit --timeout 1000 -- /bin/sleep 1 \
+    2>"$submit_two_error"
+); then
+  echo "second job submission failed" >&2
+  sed -n '1,40p' "$submit_two_error" >&2
+  exit 1
+fi
+
+if [[ "$second_job_id" != "2" ]]; then
+  echo \
+    "second submission returned '$second_job_id', expected '2'" \
+    >&2
+  exit 1
+fi
+
+# 相对路径必须被 runnerctl 拒绝。
+if "$runnerctl_path" \
+    --socket "$socket_path" \
+    submit -- echo hello \
+    >"$test_dir/invalid-submit.out" \
+    2>"$test_dir/invalid-submit.err"; then
+  echo "relative executable path was accepted" >&2
+  exit 1
+fi
+
+# 错误请求后，原来的 PING 必须继续工作。
+final_ping_error="$test_dir/final-ping.err"
+
+if ! final_ping_output=$(
+  "$runnerctl_path" \
+    --socket "$socket_path" \
+    ping \
+    2>"$final_ping_error"
+); then
+  echo "PING failed after job submissions" >&2
+  sed -n '1,40p' "$final_ping_error" >&2
+  exit 1
+fi
+
+if [[ "$final_ping_output" != "PONG" ]]; then
+  echo \
+    "final PING returned '$final_ping_output', expected 'PONG'" \
+    >&2
+  exit 1
+fi
+
+if ! kill -0 "$server_pid" 2>/dev/null; then
+  echo \
+    "runnerd exited while handling job submissions" \
+    >&2
+  sed -n '1,120p' "$server_log" >&2
+  exit 1
+fi
+
 echo "all $client_count concurrent clients received PONG"

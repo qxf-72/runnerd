@@ -30,6 +30,137 @@ void expectThrows(Function&& function, const std::string& message) {
   throw std::runtime_error(message);
 }
 
+// 正常编解码往返
+void testSubmitRequestRoundTrip() {
+  runnerd::JobSpec original;
+  original.argv = {
+      "/bin/echo",
+      "hello world",
+      "",
+  };
+
+  const std::string payload = runnerd::encodeSubmitRequest(original);
+
+  expect(runnerd::isSubmitRequest(payload), "encoded SUBMIT request was not recognized");
+
+  const runnerd::JobSpec decoded = runnerd::decodeSubmitRequest(payload);
+
+  expect(decoded.argv == original.argv, "SUBMIT argv was not preserved");
+
+  expect(!decoded.execution_timeout.has_value(), "SUBMIT without timeout gained a timeout");
+
+  original.execution_timeout = runnerd::JobTimeout(5000);
+
+  const runnerd::JobSpec decoded_with_timeout =
+      runnerd::decodeSubmitRequest(runnerd::encodeSubmitRequest(original));
+
+  expect(decoded_with_timeout.argv == original.argv, "timed SUBMIT argv was not preserved");
+
+  expect(decoded_with_timeout.execution_timeout.has_value(), "SUBMIT timeout is missing");
+
+  expect(decoded_with_timeout.execution_timeout->count() == 5000,
+         "SUBMIT timeout was not preserved");
+}
+
+// 验证大端序
+void testSubmitEncodingUsesBigEndianIntegers() {
+  runnerd::JobSpec spec;
+  spec.argv = {"/bin/echo"};
+  spec.execution_timeout = runnerd::JobTimeout(5000);
+
+  const std::string payload = runnerd::encodeSubmitRequest(spec);
+
+  expect(payload.size() == 27, "SUBMIT payload size is incorrect");
+
+  expect(payload.compare(0, 6, "SUBMIT") == 0, "SUBMIT command marker is incorrect");
+
+  // 5000 == 0x00001388。
+  expect(static_cast<unsigned char>(payload[6]) == 0x00U, "timeout byte 0 is incorrect");
+
+  expect(static_cast<unsigned char>(payload[7]) == 0x00U, "timeout byte 1 is incorrect");
+
+  expect(static_cast<unsigned char>(payload[8]) == 0x13U, "timeout byte 2 is incorrect");
+
+  expect(static_cast<unsigned char>(payload[9]) == 0x88U, "timeout byte 3 is incorrect");
+
+  // argc == 1，所以第 14 个字节是 1。
+  expect(static_cast<unsigned char>(payload[13]) == 0x01U, "argument count is not big-endian");
+
+  // strlen("/bin/echo") == 9。
+  expect(static_cast<unsigned char>(payload[17]) == 0x09U, "argument length is not big-endian");
+
+  expect(payload.substr(18) == "/bin/echo", "encoded argument bytes are incorrect");
+}
+
+// 畸形请求
+void testMalformedSubmitRequests() {
+  runnerd::JobSpec spec;
+  spec.argv = {"/bin/echo"};
+
+  const std::string valid = runnerd::encodeSubmitRequest(spec);
+
+  expectThrows<std::invalid_argument>(
+      []() { static_cast<void>(runnerd::decodeSubmitRequest("SUBMI")); },
+      "incomplete SUBMIT marker was accepted");
+
+  const std::string truncated_timeout = valid.substr(0, 9);
+
+  expectThrows<std::invalid_argument>(
+      [&truncated_timeout]() {
+        static_cast<void>(runnerd::decodeSubmitRequest(truncated_timeout));
+      },
+      "truncated timeout was accepted");
+
+  const std::string truncated_argc = valid.substr(0, 13);
+
+  expectThrows<std::invalid_argument>(
+      [&truncated_argc]() { static_cast<void>(runnerd::decodeSubmitRequest(truncated_argc)); },
+      "truncated argc was accepted");
+
+  const std::string truncated_argument_length = valid.substr(0, 16);
+
+  expectThrows<std::invalid_argument>(
+      [&truncated_argument_length]() {
+        static_cast<void>(runnerd::decodeSubmitRequest(truncated_argument_length));
+      },
+      "truncated argument length was accepted");
+
+  // 把 argv[0] 的长度从 9 改成 100，
+  // 但后面实际没有 100 字节内容。
+  std::string oversized_argument = valid;
+  oversized_argument[14] = 0;
+  oversized_argument[15] = 0;
+  oversized_argument[16] = 0;
+  oversized_argument[17] = 100;
+
+  expectThrows<std::invalid_argument>(
+      [&oversized_argument]() {
+        static_cast<void>(runnerd::decodeSubmitRequest(oversized_argument));
+      },
+      "argument larger than remaining "
+      "payload was accepted");
+
+  // 原来 argc 是 1，这里改成 2，
+  // 但没有提供第二个参数。
+  std::string argc_mismatch = valid;
+  argc_mismatch[10] = 0;
+  argc_mismatch[11] = 0;
+  argc_mismatch[12] = 0;
+  argc_mismatch[13] = 2;
+
+  expectThrows<std::invalid_argument>(
+      [&argc_mismatch]() { static_cast<void>(runnerd::decodeSubmitRequest(argc_mismatch)); },
+      "argc larger than actual argument "
+      "count was accepted");
+
+  std::string trailing_bytes = valid;
+  trailing_bytes.push_back('x');
+
+  expectThrows<std::invalid_argument>(
+      [&trailing_bytes]() { static_cast<void>(runnerd::decodeSubmitRequest(trailing_bytes)); },
+      "trailing SUBMIT bytes were accepted");
+}
+
 // 验证帧头使用 4 字节大端序记录 payload 长度。
 void testEncodingUsesBigEndianLength() {
   const std::vector<char> frame = runnerd::encodeFrame("PING");
@@ -174,6 +305,9 @@ void testIncompleteAndInvalidInput() {
 int main() {
   try {
     // 每个测试函数只验证一类协议行为，失败时由异常统一报告。
+    testSubmitRequestRoundTrip();
+    testSubmitEncodingUsesBigEndianIntegers();
+    testMalformedSubmitRequests();
     testEncodingUsesBigEndianLength();
     testFragmentedFrame();
     testMultipleFramesInOneFeed();
