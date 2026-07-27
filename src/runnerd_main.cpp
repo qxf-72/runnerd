@@ -11,8 +11,10 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "runnerd/job.h"
 #include "runnerd/protocol.h"
 #include "runnerd/unix_socket.h"
 
@@ -49,6 +51,9 @@ struct Connection {
 };
 
 using Connections = std::unordered_map<int, Connection>;
+
+// 任务属于 daemon，而不是某一条客户端连接。
+using Jobs = std::unordered_map<runnerd::JobId, runnerd::Job>;
 
 bool hasPendingWrite(const Connection& connection) {
   return connection.write_offset < connection.write_buffer.size();
@@ -150,10 +155,69 @@ void acceptClients(int listen_fd, int epoll_fd, Connections& connections) {
   }
 }
 
+std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id) {
+  if (request == "PING") {
+    std::cout << "received PING\n";
+    return "PONG";
+  }
+
+  if (!runnerd::isSubmitRequest(request)) {
+    std::cerr << "received unknown request\n";
+
+    return "ERR unknown request";
+  }
+
+  try {
+    runnerd::JobSpec spec = runnerd::decodeSubmitRequest(request);
+
+    // 客户端已经校验过也不能信任。
+    runnerd::validateJobSpec(spec);
+
+    // JobId 从 1 开始。
+    // uint64_t 溢出后会回到 0。
+    if (next_job_id == 0) {
+      throw std::overflow_error("job id space exhausted");
+    }
+
+    const runnerd::JobId job_id = next_job_id;
+
+    // 先准备响应，避免任务已经插入后，
+    // 构造响应字符串才发生异常。
+    const std::string response = "OK " + std::to_string(job_id);
+
+    runnerd::Job job;
+    job.id = job_id;
+    job.spec = std::move(spec);
+
+    // state 不需要手动设置，
+    // Job 默认状态就是 kQueued。
+
+    const bool inserted = jobs.emplace(job_id, std::move(job)).second;
+
+    if (!inserted) {
+      throw std::logic_error("duplicate job id");
+    }
+
+    // 只有保存成功后才消耗这个 ID。
+    ++next_job_id;
+
+    std::cout << "accepted job " << job_id << '\n';
+
+    return response;
+  } catch (const std::invalid_argument& exception) {
+    // 请求结构或 JobSpec 不合法：
+    // 返回 ERR，但不终止 daemon。
+    std::cerr << "rejected SUBMIT: " << exception.what() << '\n';
+
+    return std::string("ERR ") + exception.what();
+  }
+}
+
 // 返回值：
 // true：本轮读取正常结束，继续保留连接。
 // false：发生无法恢复的读取错误，需要清理连接。
-bool handleClientRead(int client_fd, Connection& connection) {
+bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
+                      runnerd::JobId& next_job_id) {
   char buffer[4096];
   for (;;) {
     const ssize_t n = ::read(client_fd, buffer, sizeof(buffer));
@@ -165,15 +229,7 @@ bool handleClientRead(int client_fd, Connection& connection) {
       while (connection.decoder.hasFrame()) {
         const std::string request = connection.decoder.popFrame();
 
-        std::string response_payload;
-
-        if (request == "PING") {
-          std::cout << "received PING\n";
-          response_payload = "PONG";
-        } else {
-          std::cerr << "received unknown request\n";
-          response_payload = "ERR!";
-        }
+        const std::string response_payload = handleRequest(request, jobs, next_job_id);
 
         const std::vector<char> response = runnerd::encodeFrame(response_payload);
 
@@ -235,6 +291,12 @@ int main(int argc, char* argv[]) {
 
     Connections connections;
 
+    // 任务表与 daemon 生命周期相同。
+    // 客户端断开时不能删除任务。
+    Jobs jobs;
+
+    runnerd::JobId next_job_id = 1;
+
     epoll_event listen_event{};
     listen_event.events = EPOLLIN;
     listen_event.data.fd = listen_fd;
@@ -283,7 +345,7 @@ int main(int argc, char* argv[]) {
           // EPOLLIN 表示有数据可读；EPOLLRDHUP 表示对端关闭了发送方向。
           // 两者可能同时出现，所以仍要调用 read 把对端最后发送的数据读完。
           if (connection_alive && (event_mask & (EPOLLIN | EPOLLRDHUP)) != 0) {
-            connection_alive = handleClientRead(fd, it->second);
+            connection_alive = handleClientRead(fd, it->second, jobs, next_job_id);
           }
 
           // EPOLLOUT 表示当前可以继续写。handleClientWrite 会从 write_offset

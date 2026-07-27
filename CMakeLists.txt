@@ -13,6 +13,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 生成 compile_commands.json，供 clangd 获取项目的真实编译参数。
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+
+
+
 add_library(runnerd_protocol STATIC
     src/protocol.cpp
 )
@@ -27,6 +30,9 @@ target_compile_options(runnerd_protocol PRIVATE
     -Wpedantic
 )
 
+
+
+
 add_library(runnerd_job STATIC
     src/job.cpp
 )
@@ -40,6 +46,13 @@ target_compile_options(runnerd_job PRIVATE
     -Wextra
     -Wpedantic
 )
+
+# encodeSubmitRequest() 调用了 validateJobSpec()，因此 runnerd_protocol 依赖 runnerd_job。
+target_link_libraries(runnerd_protocol PUBLIC
+    runnerd_job
+)
+
+
 
 
 add_executable(runnerd
@@ -66,6 +79,9 @@ target_compile_definitions(runnerd PRIVATE
     _GNU_SOURCE
 )
 
+
+
+
 add_executable(runnerctl
     src/runnerctl_main.cpp
     src/unix_socket.cpp
@@ -84,6 +100,9 @@ target_compile_options(runnerctl PRIVATE
     -Wextra
     -Wpedantic
 )
+
+
+
 
 enable_testing()
 

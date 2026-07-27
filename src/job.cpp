@@ -88,6 +88,11 @@ void validateJobSpec(const JobSpec& spec) {
     throw std::invalid_argument("job argv[0] must not be empty");
   }
 
+  // runnerd 只接受绝对路径。
+  if (spec.argv.front().front() != '/') {
+    throw std::invalid_argument("job argv[0] must be an absolute path");
+  }
+
   for (const std::string& argument : spec.argv) {
     // exec 接口使用 C 字符串，参数中的 NUL 会导致内容被提前截断。
     if (argument.find('\0') != std::string::npos) {

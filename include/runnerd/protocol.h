@@ -6,10 +6,23 @@
 #include <string>
 #include <vector>
 
+#include "runnerd/job.h"
+
 namespace runnerd {
 
 constexpr std::size_t kFrameHeaderSize = sizeof(std::uint32_t);
 constexpr std::size_t kMaxFrameSize = 64U * 1024U;
+
+// 判断 payload 是否使用 SUBMIT 请求格式。
+bool isSubmitRequest(const std::string& payload);
+
+// 将任务参数编码为 SUBMIT payload。
+// 返回值不包含外层的 4 字节帧头。
+std::string encodeSubmitRequest(const JobSpec& spec);
+
+// 从 SUBMIT payload 中还原任务参数。
+// 这里只检查二进制结构，不负责服务端业务校验。
+JobSpec decodeSubmitRequest(const std::string& payload);
 
 // 将 payload 编码为“4 字节大端长度 + payload”。
 std::vector<char> encodeFrame(const std::string& payload);
