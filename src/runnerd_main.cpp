@@ -27,8 +27,7 @@ bool parseCommandLine(int argc, char* argv[], std::string& socket_path) {
     return true;
   }
 
-  if (argc == 3 && std::string(argv[1]) == "--socket" &&
-      argv[2][0] != '\0') {
+  if (argc == 3 && std::string(argv[1]) == "--socket" && argv[2][0] != '\0') {
     socket_path = argv[2];
     return true;
   }
@@ -112,7 +111,7 @@ void closeClient(int epoll_fd, int client_fd, Connections& connections) {
 }
 
 void acceptClients(int listen_fd, int epoll_fd, Connections& connections) {
-  while (true) {
+  for (;;) {
     const int client_fd = ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
 
     if (client_fd == -1) {
@@ -258,9 +257,6 @@ int main(int argc, char* argv[]) {
 
       for (int i = 0; i < count; ++i) {
         const int fd = events[i].data.fd;
-
-        // data.fd 表示“哪个 fd 就绪”，events 表示“发生了哪些事件”。
-        // 同一个 fd 一次可能同时带有 EPOLLIN、EPOLLOUT、EPOLLRDHUP 等多个标志。
         const std::uint32_t event_mask = events[i].events;
 
         if (fd == listen_fd) {
@@ -268,6 +264,8 @@ int main(int argc, char* argv[]) {
           continue;
         }
 
+        // 正常情况下客户端 fd 一定存在。
+        // 这里防止已经进入 events 数组的旧事件访问已删除的连接状态。
         auto it = connections.find(fd);
         if (it == connections.end()) {
           continue;
@@ -284,8 +282,7 @@ int main(int argc, char* argv[]) {
 
           // EPOLLIN 表示有数据可读；EPOLLRDHUP 表示对端关闭了发送方向。
           // 两者可能同时出现，所以仍要调用 read 把对端最后发送的数据读完。
-          if (connection_alive &&
-              (event_mask & (EPOLLIN | EPOLLRDHUP)) != 0) {
+          if (connection_alive && (event_mask & (EPOLLIN | EPOLLRDHUP)) != 0) {
             connection_alive = handleClientRead(fd, it->second);
           }
 
