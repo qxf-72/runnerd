@@ -77,6 +77,10 @@ struct Job {
 
   // 保存无法启动或执行任务时的错误说明，例如 execve failed: No such file or directory。
   std::string failure_message;
+
+  // 本阶段先将输出保存在内存中；输出上限将在后续阶段加入。
+  std::string standard_output;
+  std::string standard_error;
 };
 
 // 执行一次状态迁移；迁移不合法时抛出 std::logic_error，且不会修改原状态。

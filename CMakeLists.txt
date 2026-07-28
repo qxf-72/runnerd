@@ -91,6 +91,7 @@ target_compile_definitions(runnerd_process PRIVATE
 add_executable(runnerd
     src/runnerd_main.cpp
     src/unix_socket.cpp
+    src/process_monitor.cpp
 )
 
 target_include_directories(runnerd PRIVATE
@@ -100,6 +101,7 @@ target_include_directories(runnerd PRIVATE
 target_link_libraries(runnerd PRIVATE
     runnerd_fd_utils
     runnerd_protocol
+    runnerd_process
 )
 
 target_compile_options(runnerd PRIVATE

@@ -52,8 +52,8 @@ bool isTerminal(JobState state) {
 bool canTransition(JobState from, JobState to) {
   switch (from) {
     case JobState::kQueued:
-      // 排队中的任务可以开始执行，也可以在启动前被取消或中断。
-      return to == JobState::kRunning || to == JobState::kCancelled || to == JobState::kInterrupted;
+      return to == JobState::kRunning || to == JobState::kFailed || to == JobState::kCancelled ||
+             to == JobState::kInterrupted;
 
     case JobState::kRunning:
       // 运行中的任务可能直接结束，也可能先进入等待终止的中间状态。

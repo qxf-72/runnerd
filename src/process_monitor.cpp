@@ -1,0 +1,453 @@
+#include "runnerd/process_monitor.h"
+
+#include <sys/epoll.h>
+#include <sys/signalfd.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "runnerd/process_launcher.h"
+
+namespace runnerd {
+
+namespace {
+
+void closeFd(int& fd) noexcept {
+  if (fd != -1) {
+    static_cast<void>(::close(fd));
+    fd = -1;
+  }
+}
+
+const char* startupStageName(ChildStartupStage stage) {
+  switch (stage) {
+    case ChildStartupStage::kParentDied:
+      return "parent-death check";
+    case ChildStartupStage::kSetParentDeathSignal:
+      return "PR_SET_PDEATHSIG";
+    case ChildStartupStage::kSetProcessGroup:
+      return "setpgid";
+    case ChildStartupStage::kDuplicateStdin:
+      return "dup2 stdin";
+    case ChildStartupStage::kDuplicateStdout:
+      return "dup2 stdout";
+    case ChildStartupStage::kDuplicateStderr:
+      return "dup2 stderr";
+    case ChildStartupStage::kExecve:
+      return "execve";
+  }
+
+  return "unknown startup stage";
+}
+
+}  // namespace
+
+ProcessMonitor::ProcessMonitor(int epoll_fd, JobTable& jobs) : epoll_fd_(epoll_fd), jobs_(jobs) {
+  sigset_t signal_mask{};
+
+  if (::sigemptyset(&signal_mask) == -1 || ::sigaddset(&signal_mask, SIGCHLD) == -1) {
+    throw std::system_error(errno, std::generic_category(), "configure SIGCHLD signal mask");
+  }
+
+  // 必须在启动任何任务前屏蔽 SIGCHLD，避免子进程很快退出时漏掉通知。
+  if (::sigprocmask(SIG_BLOCK, &signal_mask, nullptr) == -1) {
+    throw std::system_error(errno, std::generic_category(), "block SIGCHLD");
+  }
+
+  sigchld_fd_ = ::signalfd(-1, &signal_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+
+  if (sigchld_fd_ == -1) {
+    throw std::system_error(errno, std::generic_category(), "create signalfd");
+  }
+
+  epoll_event event{};
+  event.events = EPOLLIN;
+  event.data.fd = sigchld_fd_;
+
+  if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, sigchld_fd_, &event) == -1) {
+    const int error_number = errno;
+    closeFd(sigchld_fd_);
+
+    throw std::system_error(error_number, std::generic_category(), "add signalfd to epoll");
+  }
+}
+
+ProcessMonitor::~ProcessMonitor() {
+  for (const auto& [fd, ignored] : tracked_fds_) {
+    static_cast<void>(ignored);
+    static_cast<void>(::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr));
+    static_cast<void>(::close(fd));
+  }
+
+  if (sigchld_fd_ != -1) {
+    static_cast<void>(::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, sigchld_fd_, nullptr));
+    closeFd(sigchld_fd_);
+  }
+}
+
+bool ProcessMonitor::ownsFileDescriptor(int fd) const {
+  return fd == sigchld_fd_ || tracked_fds_.find(fd) != tracked_fds_.end();
+}
+
+void ProcessMonitor::failQueuedJob(Job& job, const std::string& message) {
+  transitionJob(job, JobState::kFailed);
+  job.failure_message = message;
+
+  std::cerr << "job " << job.id << " failed before startup: " << message << '\n';
+}
+
+void ProcessMonitor::registerProcessFd(int fd, JobId job_id, ProcessFdKind kind) {
+  const bool inserted = tracked_fds_.emplace(fd, TrackedFd{job_id, kind}).second;
+
+  if (!inserted) {
+    throw std::logic_error("process fd is already registered");
+  }
+
+  epoll_event event{};
+  event.events = EPOLLIN;
+  event.data.fd = fd;
+
+  if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) == -1) {
+    const int error_number = errno;
+    tracked_fds_.erase(fd);
+
+    throw std::system_error(error_number, std::generic_category(), "add process pipe to epoll");
+  }
+}
+
+void ProcessMonitor::abandonStartedJob(JobId job_id, const std::string& message) {
+  auto active_it = active_jobs_.find(job_id);
+
+  if (active_it == active_jobs_.end()) {
+    return;
+  }
+
+  ActiveProcess& process = active_it->second;
+
+  const std::array<int, 3> fds{
+      process.stdout_fd,
+      process.stderr_fd,
+      process.startup_error_fd,
+  };
+
+  for (const int fd : fds) {
+    if (fd == -1) {
+      continue;
+    }
+
+    static_cast<void>(::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr));
+    tracked_fds_.erase(fd);
+    static_cast<void>(::close(fd));
+  }
+
+  if (process.process_group_id > 0) {
+    static_cast<void>(::kill(-process.process_group_id, SIGKILL));
+  }
+
+  int status = 0;
+
+  while (::waitpid(process.pid, &status, 0) == -1 && errno == EINTR) {
+  }
+
+  pid_to_job_.erase(process.pid);
+  active_jobs_.erase(active_it);
+
+  Job& job = jobs_.at(job_id);
+  transitionJob(job, JobState::kFailed);
+  job.failure_message = message;
+
+  std::cerr << "job " << job_id << " failed during registration: " << message << '\n';
+}
+
+void ProcessMonitor::startJob(JobId job_id) {
+  Job& job = jobs_.at(job_id);
+
+  if (job.state != JobState::kQueued) {
+    throw std::logic_error("only QUEUED jobs can be started");
+  }
+
+  LaunchedProcess launched{};
+
+  try {
+    launched = launchProcess(job.spec);
+  } catch (const std::exception& exception) {
+    failQueuedJob(job, std::string("launchProcess failed: ") + exception.what());
+    return;
+  }
+
+  transitionJob(job, JobState::kRunning);
+  job.pid = launched.pid;
+  job.process_group_id = launched.process_group_id;
+
+  try {
+    const bool inserted = active_jobs_
+                              .emplace(job_id,
+                                       ActiveProcess{
+                                           launched.pid,
+                                           launched.process_group_id,
+                                           launched.stdout_fd,
+                                           launched.stderr_fd,
+                                           launched.startup_error_fd,
+                                       })
+                              .second;
+
+    if (!inserted) {
+      throw std::logic_error("job already has an active process");
+    }
+
+    pid_to_job_.emplace(launched.pid, job_id);
+
+    registerProcessFd(launched.stdout_fd, job_id, ProcessFdKind::kStdout);
+    registerProcessFd(launched.stderr_fd, job_id, ProcessFdKind::kStderr);
+    registerProcessFd(launched.startup_error_fd, job_id, ProcessFdKind::kStartupError);
+
+    std::cout << "started job " << job_id << " with pid " << launched.pid << '\n';
+  } catch (const std::exception& exception) {
+    abandonStartedJob(job_id, std::string("failed to monitor child process: ") + exception.what());
+  }
+}
+
+void ProcessMonitor::closeTrackedFd(int fd) {
+  const auto tracked_it = tracked_fds_.find(fd);
+
+  if (tracked_it == tracked_fds_.end()) {
+    return;
+  }
+
+  const TrackedFd tracked = tracked_it->second;
+  const auto active_it = active_jobs_.find(tracked.job_id);
+
+  if (active_it != active_jobs_.end()) {
+    ActiveProcess& process = active_it->second;
+
+    switch (tracked.kind) {
+      case ProcessFdKind::kStdout:
+        process.stdout_fd = -1;
+        process.stdout_eof = true;
+        break;
+      case ProcessFdKind::kStderr:
+        process.stderr_fd = -1;
+        process.stderr_eof = true;
+        break;
+      case ProcessFdKind::kStartupError:
+        process.startup_error_fd = -1;
+        process.startup_error_eof = true;
+        break;
+    }
+  }
+
+  static_cast<void>(::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr));
+  static_cast<void>(::close(fd));
+  tracked_fds_.erase(tracked_it);
+}
+
+void ProcessMonitor::drainProcessFd(int fd) {
+  const auto tracked_it = tracked_fds_.find(fd);
+
+  if (tracked_it == tracked_fds_.end()) {
+    return;
+  }
+
+  const TrackedFd tracked = tracked_it->second;
+  ActiveProcess& process = active_jobs_.at(tracked.job_id);
+
+  char buffer[4096];
+
+  for (;;) {
+    const ssize_t size = ::read(fd, buffer, sizeof(buffer));
+
+    if (size > 0) {
+      const std::size_t byte_count = static_cast<std::size_t>(size);
+
+      switch (tracked.kind) {
+        case ProcessFdKind::kStdout:
+          process.standard_output.append(buffer, byte_count);
+          break;
+        case ProcessFdKind::kStderr:
+          process.standard_error.append(buffer, byte_count);
+          break;
+        case ProcessFdKind::kStartupError:
+          process.startup_error_bytes.append(buffer, byte_count);
+          break;
+      }
+
+      continue;
+    }
+
+    if (size == 0) {
+      closeTrackedFd(fd);
+      return;
+    }
+
+    if (errno == EINTR) {
+      continue;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return;
+    }
+
+    throw std::system_error(errno, std::generic_category(), "read child process pipe");
+  }
+}
+
+void ProcessMonitor::reapExitedChildren() {
+  for (;;) {
+    int wait_status = 0;
+    const pid_t pid = ::waitpid(-1, &wait_status, WNOHANG);
+
+    if (pid > 0) {
+      const auto pid_it = pid_to_job_.find(pid);
+
+      if (pid_it == pid_to_job_.end()) {
+        continue;
+      }
+
+      const JobId job_id = pid_it->second;
+      ActiveProcess& process = active_jobs_.at(job_id);
+
+      process.child_exited = true;
+      process.wait_status = wait_status;
+
+      tryFinalizeJob(job_id);
+      continue;
+    }
+
+    if (pid == 0) {
+      return;
+    }
+
+    if (errno == EINTR) {
+      continue;
+    }
+
+    if (errno == ECHILD) {
+      return;
+    }
+
+    throw std::system_error(errno, std::generic_category(), "waitpid");
+  }
+}
+
+void ProcessMonitor::handleSigchld() {
+  std::array<signalfd_siginfo, 8> signals{};
+
+  for (;;) {
+    const ssize_t size = ::read(sigchld_fd_, signals.data(), sizeof(signals));
+
+    if (size > 0) {
+      if (size % static_cast<ssize_t>(sizeof(signalfd_siginfo)) != 0) {
+        throw std::runtime_error("signalfd returned a partial record");
+      }
+
+      continue;
+    }
+
+    if (size == -1 && errno == EINTR) {
+      continue;
+    }
+
+    if (size == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      break;
+    }
+
+    throw std::system_error(errno, std::generic_category(), "read signalfd");
+  }
+
+  // SIGCHLD 可能合并，因此必须循环 waitpid，而不是每次信号只回收一个。
+  reapExitedChildren();
+}
+
+void ProcessMonitor::tryFinalizeJob(JobId job_id) {
+  const auto active_it = active_jobs_.find(job_id);
+
+  if (active_it == active_jobs_.end()) {
+    return;
+  }
+
+  ActiveProcess& process = active_it->second;
+
+  if (!process.child_exited || !process.stdout_eof || !process.stderr_eof ||
+      !process.startup_error_eof) {
+    return;
+  }
+
+  Job& job = jobs_.at(job_id);
+
+  job.standard_output.swap(process.standard_output);
+  job.standard_error.swap(process.standard_error);
+
+  if (process.startup_error_bytes.empty()) {
+    if (WIFEXITED(process.wait_status)) {
+      job.exit_code = WEXITSTATUS(process.wait_status);
+
+      if (*job.exit_code == 0) {
+        transitionJob(job, JobState::kSucceeded);
+      } else {
+        transitionJob(job, JobState::kFailed);
+        job.failure_message = "process exited with code " + std::to_string(*job.exit_code);
+      }
+    } else if (WIFSIGNALED(process.wait_status)) {
+      job.exit_signal = WTERMSIG(process.wait_status);
+      transitionJob(job, JobState::kFailed);
+      job.failure_message = "process terminated by signal " + std::to_string(*job.exit_signal);
+    } else {
+      transitionJob(job, JobState::kFailed);
+      job.failure_message = "unexpected waitpid status";
+    }
+  } else if (process.startup_error_bytes.size() == sizeof(ChildStartupError)) {
+    ChildStartupError startup_error{};
+    std::memcpy(&startup_error, process.startup_error_bytes.data(), sizeof(startup_error));
+
+    transitionJob(job, JobState::kFailed);
+    job.failure_message = std::string("child startup failed at ") +
+                          startupStageName(startup_error.stage) + ": " +
+                          std::strerror(startup_error.error_number);
+  } else {
+    transitionJob(job, JobState::kFailed);
+    job.failure_message = "malformed child startup error record";
+  }
+
+  std::cout << "job " << job.id << " finished: " << jobStateName(job.state)
+            << ", stdout=" << job.standard_output.size()
+            << " bytes, stderr=" << job.standard_error.size() << " bytes\n"
+            << std::flush;
+
+  pid_to_job_.erase(process.pid);
+  active_jobs_.erase(active_it);
+}
+
+void ProcessMonitor::handleFileDescriptorEvent(int fd, std::uint32_t event_mask) {
+  if (fd == sigchld_fd_) {
+    handleSigchld();
+    return;
+  }
+
+  if ((event_mask & (EPOLLIN | EPOLLHUP | EPOLLERR)) == 0) {
+    return;
+  }
+
+  const auto tracked_it = tracked_fds_.find(fd);
+
+  if (tracked_it == tracked_fds_.end()) {
+    return;
+  }
+
+  const JobId job_id = tracked_it->second.job_id;
+
+  // 即使收到 EPOLLHUP，也必须先 read 到 EOF；
+  // 否则可能丢掉管道里的最后一段输出。
+  drainProcessFd(fd);
+  tryFinalizeJob(job_id);
+}
+
+}  // namespace runnerd

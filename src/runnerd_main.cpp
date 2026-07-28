@@ -16,6 +16,7 @@
 
 #include "runnerd/fd_utils.h"
 #include "runnerd/job.h"
+#include "runnerd/process_monitor.h"
 #include "runnerd/protocol.h"
 #include "runnerd/unix_socket.h"
 
@@ -54,7 +55,7 @@ struct Connection {
 using Connections = std::unordered_map<int, Connection>;
 
 // 任务属于 daemon，而不是某一条客户端连接。
-using Jobs = std::unordered_map<runnerd::JobId, runnerd::Job>;
+using Jobs = runnerd::JobTable;
 
 bool hasPendingWrite(const Connection& connection) {
   return connection.write_offset < connection.write_buffer.size();
@@ -156,7 +157,8 @@ void acceptClients(int listen_fd, int epoll_fd, Connections& connections) {
   }
 }
 
-std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id) {
+std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id,
+                          runnerd::ProcessMonitor& process_monitor) {
   if (request == "PING") {
     std::cout << "received PING\n";
     return "PONG";
@@ -202,6 +204,8 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
     // 只有保存成功后才消耗这个 ID。
     ++next_job_id;
 
+    process_monitor.startJob(job_id);
+
     std::cout << "accepted job " << job_id << '\n';
 
     return response;
@@ -218,7 +222,7 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
 // true：本轮读取正常结束，继续保留连接。
 // false：发生无法恢复的读取错误，需要清理连接。
 bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
-                      runnerd::JobId& next_job_id) {
+                      runnerd::JobId& next_job_id, runnerd::ProcessMonitor& process_monitor) {
   char buffer[4096];
   for (;;) {
     const ssize_t n = ::read(client_fd, buffer, sizeof(buffer));
@@ -230,7 +234,8 @@ bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
       while (connection.decoder.hasFrame()) {
         const std::string request = connection.decoder.popFrame();
 
-        const std::string response_payload = handleRequest(request, jobs, next_job_id);
+        const std::string response_payload =
+            handleRequest(request, jobs, next_job_id, process_monitor);
 
         const std::vector<char> response = runnerd::encodeFrame(response_payload);
 
@@ -295,7 +300,7 @@ int main(int argc, char* argv[]) {
     // 任务表与 daemon 生命周期相同。
     // 客户端断开时不能删除任务。
     Jobs jobs;
-
+    runnerd::ProcessMonitor process_monitor(epoll_fd, jobs);
     runnerd::JobId next_job_id = 1;
 
     epoll_event listen_event{};
@@ -327,6 +332,11 @@ int main(int argc, char* argv[]) {
           continue;
         }
 
+        if (process_monitor.ownsFileDescriptor(fd)) {
+          process_monitor.handleFileDescriptorEvent(fd, event_mask);
+          continue;
+        }
+
         // 正常情况下客户端 fd 一定存在。
         // 这里防止已经进入 events 数组的旧事件访问已删除的连接状态。
         auto it = connections.find(fd);
@@ -346,7 +356,7 @@ int main(int argc, char* argv[]) {
           // EPOLLIN 表示有数据可读；EPOLLRDHUP 表示对端关闭了发送方向。
           // 两者可能同时出现，所以仍要调用 read 把对端最后发送的数据读完。
           if (connection_alive && (event_mask & (EPOLLIN | EPOLLRDHUP)) != 0) {
-            connection_alive = handleClientRead(fd, it->second, jobs, next_job_id);
+            connection_alive = handleClientRead(fd, it->second, jobs, next_job_id, process_monitor);
           }
 
           // EPOLLOUT 表示当前可以继续写。handleClientWrite 会从 write_offset
