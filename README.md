@@ -38,7 +38,7 @@
 - 安全管理 socket 文件，并处理 `EINTR`、`SIGPIPE` 和文件描述符继承
 - 支持 `runnerctl ping` 和带有可选超时的 `runnerctl submit`
 - 提供任务参数校验、JobId 分配、状态机和内存中的 `QUEUED` 任务表
-- 使用 CMake 构建，并通过 CTest 运行单元测试和集成测试
+- 使用 GoogleTest 编写单元测试和集成测试，并通过 CTest 统一运行
 
 ## 🏗️ 当前架构
 
@@ -110,7 +110,7 @@ runnerd/
 ├── tests/
 │   ├── job_test.cpp
 │   ├── protocol_test.cpp
-│   ├── runnerd_integration_test.sh
+│   ├── runnerd_integration_test.cpp
 │   └── smoke_test.cpp
 ├── docs/
 │   ├── requirements.md
@@ -127,6 +127,10 @@ runnerd/
 - Linux
 - 支持 C++17 的 GCC 或 Clang
 - CMake 3.16 或更高版本
+
+测试使用 GoogleTest 1.17.0。首次启用测试进行 CMake 配置时，
+`FetchContent` 会自动下载并校验对应源码，因此需要能够访问 GitHub；
+后续配置会复用构建目录中已经下载的依赖。
 
 ### 构建项目
 
@@ -147,6 +151,7 @@ build/
 ├── job_test
 ├── protocol_test
 ├── runnerd
+├── runnerd_integration_test
 ├── runnerctl
 └── smoke_test
 ```
@@ -228,6 +233,9 @@ received PING
 
 ### 运行测试
 
+所有测试均使用 GoogleTest 编写。CMake 的 `gtest_discover_tests()` 会把
+每个 GoogleTest 用例分别注册给 CTest，因此失败输出能够直接指出具体用例。
+
 ```bash
 cmake -E chdir build ctest --output-on-failure
 ```
@@ -239,7 +247,7 @@ cd build
 ctest --output-on-failure
 ```
 
-当前测试包括：
+当前测试目标包括：
 
 - `smoke_test`：验证基础测试目标能够成功构建和运行
 - `protocol_test`：验证大端编码、拆包、粘包、空 payload、二进制
@@ -311,7 +319,7 @@ SUBMIT 请求的 payload 格式为：
 
 ## 🗺️ 路线图
 
-- [x] 初始化 CMake、CTest、需求文档和状态机文档
+- [x] 初始化 CMake、GoogleTest、CTest、需求文档和状态机文档
 - [x] 完成 Unix Domain Socket 与 `PING/PONG` 通信
 - [x] 实现长度前缀协议和增量解码
 - [x] 使用非阻塞 I/O、连接状态、写缓冲和 `epoll` 支持多个客户端

@@ -43,7 +43,7 @@ Currently implemented:
 - `runnerctl ping` and `runnerctl submit` with an optional timeout
 - Job validation, JobId allocation, state transitions, and an in-memory
   `QUEUED` job table
-- CMake builds with unit and integration tests registered through CTest
+- Unit and integration tests written with GoogleTest and run through CTest
 
 ## 🏗️ Current Architecture
 
@@ -119,7 +119,7 @@ runnerd/
 |-- tests/
 |   |-- job_test.cpp
 |   |-- protocol_test.cpp
-|   |-- runnerd_integration_test.sh
+|   |-- runnerd_integration_test.cpp
 |   `-- smoke_test.cpp
 |-- docs/
 |   |-- requirements.md
@@ -136,6 +136,11 @@ runnerd/
 - Linux
 - GCC or Clang with C++17 support
 - CMake 3.16 or later
+
+The test suite uses GoogleTest 1.17.0. On the first CMake configuration with
+tests enabled, `FetchContent` downloads and verifies its source, so access to
+GitHub is required. Later configurations reuse the dependency already present
+in the build directory.
 
 ### Build
 
@@ -156,6 +161,7 @@ build/
 |-- job_test
 |-- protocol_test
 |-- runnerd
+|-- runnerd_integration_test
 |-- runnerctl
 `-- smoke_test
 ```
@@ -238,6 +244,10 @@ startup using the same path checks and safely removes it.
 
 ### Run the Tests
 
+All tests are written with GoogleTest. CMake's `gtest_discover_tests()`
+registers each GoogleTest case separately with CTest, so failures identify the
+specific case directly.
+
 ```bash
 cmake -E chdir build ctest --output-on-failure
 ```
@@ -249,7 +259,7 @@ cd build
 ctest --output-on-failure
 ```
 
-The current test suite includes:
+The current test targets include:
 
 - `smoke_test`, which verifies that the basic test target builds and runs
 - `protocol_test`, which covers big-endian encoding, fragmented and coalesced
@@ -330,7 +340,8 @@ non-blocking I/O, event loops, and honest crash recovery.
 
 ## 🗺️ Roadmap
 
-- [x] Initialize CMake, CTest, requirements, and state machine documentation
+- [x] Initialize CMake, GoogleTest, CTest, requirements, and state machine
+  documentation
 - [x] Implement Unix Domain Socket `PING/PONG` communication
 - [x] Implement length-prefixed framing and incremental decoding
 - [x] Support multiple clients with non-blocking I/O, connection state, output
