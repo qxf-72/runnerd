@@ -1,6 +1,5 @@
 #include "runnerd/unix_socket.h"
 
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -171,20 +170,6 @@ int connectUnixSocket(const std::string& socket_path) {
   }
 
   return socket_fd;
-}
-
-int setNonBlocking(int fd) {
-  const int flags = ::fcntl(fd, F_GETFL, 0);
-
-  if (flags == -1) {
-    throw makeSystemError("get file status flags");
-  }
-
-  if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-    throw makeSystemError("set non-blocking mode");
-  }
-
-  return fd;
 }
 
 }  // namespace runnerd

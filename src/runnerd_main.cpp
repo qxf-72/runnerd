@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "runnerd/fd_utils.h"
 #include "runnerd/job.h"
 #include "runnerd/protocol.h"
 #include "runnerd/unix_socket.h"

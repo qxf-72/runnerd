@@ -13,6 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 生成 compile_commands.json，供 clangd 获取项目的真实编译参数。
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# 长度前缀协议和请求编解码。
 add_library(runnerd_protocol STATIC
     src/protocol.cpp
 )
@@ -27,6 +28,7 @@ target_compile_options(runnerd_protocol PRIVATE
     -Wpedantic
 )
 
+# 任务数据模型、参数校验和状态机。
 add_library(runnerd_job STATIC
     src/job.cpp
 )
@@ -46,6 +48,46 @@ target_link_libraries(runnerd_protocol PUBLIC
     runnerd_job
 )
 
+# 多个模块共用的文件描述符操作。
+add_library(runnerd_fd_utils STATIC
+    src/fd_utils.cpp
+)
+
+target_include_directories(runnerd_fd_utils PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_options(runnerd_fd_utils PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+# fork/execve、管道重定向和进程组管理。
+add_library(runnerd_process STATIC
+    src/process_launcher.cpp
+)
+
+target_include_directories(runnerd_process PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(runnerd_process PUBLIC
+    runnerd_fd_utils
+    runnerd_job
+)
+
+target_compile_options(runnerd_process PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+target_compile_definitions(runnerd_process PRIVATE
+    _GNU_SOURCE
+)
+
+# 常驻任务执行服务。
 add_executable(runnerd
     src/runnerd_main.cpp
     src/unix_socket.cpp
@@ -56,6 +98,7 @@ target_include_directories(runnerd PRIVATE
 )
 
 target_link_libraries(runnerd PRIVATE
+    runnerd_fd_utils
     runnerd_protocol
 )
 
@@ -70,6 +113,7 @@ target_compile_definitions(runnerd PRIVATE
     _GNU_SOURCE
 )
 
+# 命令行客户端。
 add_executable(runnerctl
     src/runnerctl_main.cpp
     src/unix_socket.cpp
@@ -89,6 +133,7 @@ target_compile_options(runnerctl PRIVATE
     -Wpedantic
 )
 
+# GoogleTest 测试目标。
 include(CTest)
 
 if(BUILD_TESTING)
@@ -186,6 +231,27 @@ if(BUILD_TESTING)
     # 防止服务端或客户端异常时让 CTest 一直等待。
     gtest_discover_tests(
         runnerd_integration_test
+        PROPERTIES TIMEOUT 10
+    )
+
+    # 独立验证进程启动器，暂时不要求 runnerd 接入任务执行。
+    add_executable(process_launcher_test
+        tests/process_launcher_test.cpp
+    )
+
+    target_link_libraries(process_launcher_test PRIVATE
+        runnerd_process
+        GTest::gtest_main
+    )
+
+    target_compile_options(process_launcher_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+
+    gtest_discover_tests(
+        process_launcher_test
         PROPERTIES TIMEOUT 10
     )
 endif()
