@@ -14,111 +14,61 @@
 
 </div>
 
-`runnerd` 面向同一台 Linux 主机上的同一用户。客户端 `runnerctl`
-通过 Unix Domain Socket 与常驻服务通信；项目最终将支持任务提交、状态查询、
-取消、超时控制、输出采集和任务历史恢复。
+`runnerd` 是一个面向单机、单用户场景的任务执行服务。客户端 `runnerctl`
+通过 Unix Domain Socket 提交命令，daemon 负责启动、监控并回收子进程。
 
 > [!IMPORTANT]
-> 项目目前处于早期开发阶段。当前版本完成了 Unix Domain Socket
-> 通信、长度前缀协议、`PING/PONG` 链路，以及带有连接状态和非阻塞
-> 写缓冲的 `epoll` 事件循环；同时已经定义任务数据模型、参数校验和
-> 状态迁移规则。`runnerctl` 现在可以提交任务，daemon 会校验参数、
-> 分配 JobId，并在内存中保存 `QUEUED` 任务；子进程启动尚未实现，因此
-> 任务目前不会真正执行。
+> 项目仍处于早期开发阶段。当前已经可以提交并执行任务；状态查询、任务列表、
+> 取消、超时终止、输出查询和持久化将在后续版本实现。
 
 ## ✨ 功能特性
 
-当前已经实现：
-
-- 基于 Unix Domain Socket 的本地客户端/服务端通信，支持自定义 socket 路径
-- 使用 4 字节大端长度前缀协议，单帧 payload 最大为 64 KiB
-- 增量帧解码，支持拆包、粘包和二进制 payload
-- 基于非阻塞 I/O 和 LT（水平触发）`epoll` 的多客户端事件循环
-- 每个连接独立维护解码器、写缓冲和连接关闭状态
-- 安全管理 socket 文件，并处理 `EINTR`、`SIGPIPE` 和文件描述符继承
-- 支持 `runnerctl ping` 和带有可选超时的 `runnerctl submit`
-- 提供任务参数校验、JobId 分配、状态机和内存中的 `QUEUED` 任务表
-- 使用 GoogleTest 编写单元测试和集成测试，并通过 CTest 统一运行
+- Unix Domain Socket 本地通信，支持自定义 socket 路径
+- 基于非阻塞 I/O 和 LT `epoll` 的多客户端事件循环
+- 长度前缀协议与增量解码，正确处理拆包、粘包和二进制 payload
+- 支持 `ping` 和 `submit`，服务端会再次校验所有任务参数
+- 使用 `fork/execve` 和独立进程组启动任务，不经过 shell
+- 通过非阻塞 pipe 采集 stdout/stderr，使用 `signalfd + waitpid` 回收子进程
+- 提供任务状态机、内存任务表以及 GoogleTest/CTest 测试
 
 ## 🏗️ 当前架构
 
 ```text
-runnerctl ping
-      │
-      │ Unix Domain Socket
-      │ /tmp/runnerd.sock（默认）
-      ▼
-   runnerd
-      │
-      └── epoll_wait
-            ├── listen fd 可读
-            │     └── accept，直到 EAGAIN
-            └── client fd
-                  ├── Connection
-                  │     ├── FrameDecoder
-                  │     ├── write buffer
-                  │     ├── write offset
-                  │     └── read closed
-                  ├── EPOLLIN
-                  │     └── read → 解码请求 → 响应入队
-                  ├── EPOLLOUT
-                  │     └── 从 write offset 继续发送
-                  └── EPOLLRDHUP
-                        └── 读完最后输入 → 排空待写响应 → 关闭
+runnerctl
+    │  Unix Domain Socket + 长度前缀协议
+    ▼
+runnerd（epoll 事件循环）
+    ├── client fd ──────────────> 解码 PING / SUBMIT，缓冲响应
+    └── ProcessMonitor
+          ├── process_launcher ─> fork / execve ─> 子进程
+          ├── process pipes ─────────────────────> 采集输出与启动错误
+          └── signalfd ─> waitpid ──────────────> 更新 Job 状态
 ```
 
-服务端使用 `Connections` 表按 fd 保存连接状态。读取时持续调用 `read`
-直到 `EAGAIN`，完整请求会被解析并将响应追加到写缓冲；存在待写数据时才
-注册 `EPOLLOUT`。如果 `write` 只发送了一部分，下一次可写事件会从保存的
-偏移继续发送，缓冲区清空后取消 `EPOLLOUT`，避免事件循环空转。
+网络连接和子进程 pipe 共用同一个 `epoll` 事件循环。客户端断开不会终止
+已经提交的任务；任务结果由 `ProcessMonitor` 在子进程退出且三个监控 pipe
+全部到达 EOF 后统一结算。
 
-SUBMIT 请求进入 daemon 后的处理流程如下：
+### 当前限制
 
-```text
-SUBMIT payload
-      │
-      ├── decodeSubmitRequest：恢复 timeout 和 argv
-      ├── validateJobSpec：检查绝对路径、NUL 和超时
-      ▼
-Job{id, spec, state = QUEUED}
-      │
-      ├── 保存到 Jobs[job_id]
-      └── 返回 "OK <job_id>"
-```
-
-`Connections` 表管理客户端连接，连接关闭后对应状态会被删除；`Jobs` 表与
-daemon 生命周期相同，因此提交任务的客户端断开后，任务仍会保留。当前任务
-不会离开 `QUEUED`，daemon 重启后 JobId 会从 1 重新开始，内存任务记录也会
-丢失。这些限制会在后续的进程执行和 journal 阶段解决。
+- `--timeout` 只会保存到 `JobSpec`，暂时不会终止超时任务
+- 没有 `status`、`list`、`cancel` 和输出查询命令
+- 没有并发上限或等待队列，合法任务会立即启动
+- 任务和输出只保存在内存中，当前也没有输出大小上限
+- daemon 重启后会丢失 JobId 计数、任务状态和输出
 
 ## 📁 项目结构
 
-```text
-runnerd/
-├── CMakeLists.txt
-├── include/
-│   └── runnerd/
-│       ├── job.h
-│       ├── protocol.h
-│       └── unix_socket.h
-├── src/
-│   ├── job.cpp
-│   ├── protocol.cpp
-│   ├── runnerd_main.cpp
-│   ├── runnerctl_main.cpp
-│   └── unix_socket.cpp
-├── tests/
-│   ├── job_test.cpp
-│   ├── protocol_test.cpp
-│   ├── runnerd_integration_test.cpp
-│   └── smoke_test.cpp
-├── docs/
-│   ├── requirements.md
-│   └── state_machine.md
-├── LICENSE
-├── README.md
-└── README_EN.md
-```
+| 模块 | 职责 |
+| --- | --- |
+| `protocol` | 帧协议及 PING/SUBMIT 编解码 |
+| `job` | 任务模型、参数校验和状态机 |
+| `process_launcher` | pipe、fork、重定向、进程组和 execve |
+| `process_monitor` | epoll 注册、输出采集、SIGCHLD 和任务结算 |
+| `unix_socket` | Unix Domain Socket 创建与连接 |
+| `runnerd_main` | daemon 入口与事件循环 |
+| `runnerctl_main` | 命令行客户端 |
+| `tests/` | 单元测试和端到端集成测试 |
 
 ## 🚀 编译运行
 
@@ -142,20 +92,6 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-构建完成后会生成：
-
-```text
-build/
-├── librunnerd_job.a
-├── librunnerd_protocol.a
-├── job_test
-├── protocol_test
-├── runnerd
-├── runnerd_integration_test
-├── runnerctl
-└── smoke_test
-```
-
 ### 运行示例
 
 命令格式：
@@ -167,141 +103,70 @@ runnerctl [--socket <path>] submit [--timeout <milliseconds>] \
           -- <absolute-path> [arguments...]
 ```
 
-在第一个终端启动服务：
+在第一个终端启动 daemon：
 
 ```bash
 ./build/runnerd
 ```
 
-预期输出：
-
-```text
-runnerd is listening on /tmp/runnerd.sock
-```
-
-在第二个终端发送请求：
+在第二个终端检查连接并提交任务：
 
 ```bash
-./build/runnerctl ping
+./build/runnerctl ping                         # 输出 PONG
+./build/runnerctl submit -- /bin/echo hello   # 输出 JobId，例如 1
 ```
 
-客户端预期输出：
+提交带有正数毫秒超时配置的任务：
 
-```text
-PONG
+```bash
+./build/runnerctl submit --timeout 5000 -- /bin/sleep 1
 ```
 
-服务端会同时输出：
-
-```text
-received PING
-```
-
-省略 `--socket` 时，两个程序都使用 `/tmp/runnerd.sock`。如需指定其他
-路径，服务端和客户端必须使用相同的参数：
+省略 `--socket` 时默认使用 `/tmp/runnerd.sock`。自定义路径时，服务端和
+客户端必须使用相同参数：
 
 ```bash
 ./build/runnerd --socket /tmp/runnerd-demo.sock
 ./build/runnerctl --socket /tmp/runnerd-demo.sock ping
 ```
 
-提交一个没有超时的任务：
-
-```bash
-./build/runnerctl submit -- /bin/echo hello
-```
-
-客户端会输出 daemon 分配的 JobId，例如：
-
-```text
-1
-```
-
-也可以提交带有正数毫秒超时的任务：
-
-```bash
-./build/runnerctl submit --timeout 5000 -- /bin/sleep 1
-```
-
 `--` 表示 `runnerctl` 自身的选项到此结束，后面的内容全部属于任务 argv。
 `argv[0]` 必须是绝对路径，所以 `echo hello` 和 `./echo hello` 会被拒绝。
-当前版本只保存 `QUEUED` 任务，不会执行命令；提交 `/bin/echo hello` 后看不到
-`hello` 输出属于预期行为。
-
-如果服务异常退出并留下旧的 socket 文件，下次使用相同路径启动时会检查并
-安全清理失效文件。
+stdout/stderr 会由 daemon 采集，但目前还不能通过客户端查询。
 
 ### 运行测试
-
-所有测试均使用 GoogleTest 编写。CMake 的 `gtest_discover_tests()` 会把
-每个 GoogleTest 用例分别注册给 CTest，因此失败输出能够直接指出具体用例。
 
 ```bash
 cmake -E chdir build ctest --output-on-failure
 ```
 
-也可以进入构建目录运行：
-
-```bash
-cd build
-ctest --output-on-failure
-```
-
 当前测试目标包括：
 
-- `smoke_test`：验证基础测试目标能够成功构建和运行
-- `protocol_test`：验证大端编码、拆包、粘包、空 payload、二进制
-  payload、64 KiB 边界、SUBMIT 编解码以及畸形 SUBMIT 拒绝
-- `job_test`：验证合法和非法任务参数、全部合法状态迁移、典型非法迁移，
-  终态判断和绝对程序路径约束
-- `runnerd_integration_test`：使用独立临时 socket 启动真实 daemon，
-  验证 20 个并发 `PING`、连续提交时 JobId 递增、正数超时传递、相对路径
-  拒绝，以及提交后 `PING` 仍然可用
-
-跨事件拆包、半关闭和部分写入等异常场景的集成测试将在后续阶段继续补充。
+| 测试目标 | 主要覆盖 |
+| --- | --- |
+| `protocol_test` | 帧编解码、边界和畸形输入 |
+| `job_test` | 参数校验、状态迁移和终态判断 |
+| `process_launcher_test` | fork/execve、pipe、进程组和启动错误 |
+| `process_monitor_test` | 输出采集、退出结算、大输出和并发回收 |
+| `runnerd_integration_test` | 真实 daemon、并发 PING 和 SUBMIT |
 
 ## 📡 当前协议
 
 Unix Domain Stream Socket 与 TCP 一样不保留消息边界，因此当前协议使用
-4 字节大端长度字段来界定每个 payload：
+4 字节大端长度前缀界定 payload，单帧最大为 64 KiB：
 
 ```text
-+------------------------+----------------------+
-| payload length (4 字节) | payload (变长)       |
-| 大端无符号整数          | 最大 64 KiB          |
-+------------------------+----------------------+
+[ payload length: uint32 big-endian ][ payload bytes ]
 ```
 
-PING 请求和响应 payload 为：
+| 请求 | 成功响应 |
+| --- | --- |
+| `PING` | `PONG` |
+| `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
 
-```text
-request:  "PING"
-response: "PONG"
-```
-
-SUBMIT 请求的 payload 格式为：
-
-```text
-+----------------------+--------------------------------------+
-| 字段                 | 含义                                 |
-+----------------------+--------------------------------------+
-| "SUBMIT"             | 6 字节请求标记                       |
-| timeout_ms           | 4 字节大端整数；0 表示不设置超时     |
-| argc                 | 4 字节大端参数数量                   |
-| argument_length      | 4 字节大端参数长度                   |
-| argument             | 对应长度的原始参数字节               |
-| ...                  | 后续参数重复“长度 + 内容”             |
-+----------------------+--------------------------------------+
-```
-
-成功提交返回 `"OK <job_id>"`；无法识别的请求或非法 SUBMIT 返回
-`"ERR <message>"`。客户端显示 JobId 时只输出数字，错误信息写入标准错误。
-
-`FrameDecoder` 可以多次接收不完整数据，也可以从一次输入中依次取出多个
-完整帧。声明长度超过 64 KiB 的帧会被拒绝。daemon 为每条客户端连接保存
-独立的解码器，因此请求帧可以跨越多次 `read` 和多次 `epoll` 事件到达；
-同一次读取中的多个完整请求也会被依次处理并生成响应。未知请求会收到
-`ERR` 响应；外层帧非法或超长时，服务端会关闭对应的客户端连接。
+SUBMIT 中的整数和参数长度同样使用大端无符号整数；`timeout_ms = 0`
+表示不设置超时。非法请求返回 `ERR <message>`。`FrameDecoder` 支持跨多次
+读取组装一帧，也能从一次读取中解析多帧。
 
 ## 🎯 设计边界
 
@@ -324,8 +189,8 @@ SUBMIT 请求的 payload 格式为：
 - [x] 实现长度前缀协议和增量解码
 - [x] 使用非阻塞 I/O、连接状态、写缓冲和 `epoll` 支持多个客户端
 - [x] 定义任务数据模型、参数校验、状态迁移规则和对应单元测试
-- [x] 实现 SUBMIT 编解码、JobId 分配和内存中的 `QUEUED` 任务表
-- [ ] 使用 `fork/execve` 启动任务并采集 stdout/stderr
+- [x] 实现 SUBMIT 编解码、JobId 分配和内存任务表
+- [x] 使用 `fork/execve` 启动任务并采集 stdout/stderr
 - [ ] 实现并发队列、取消和超时
 - [ ] 使用 journal 保存任务历史并支持重启恢复
 - [ ] 补充更多异常场景集成测试、Sanitizer 检查和诊断报告
@@ -334,6 +199,7 @@ SUBMIT 请求的 payload 格式为：
 
 - [需求说明](docs/requirements.md)
 - [任务状态机](docs/state_machine.md)
+- [进程启动器](docs/process_launcher.md)
 
 ## 🤝 Contributing
 

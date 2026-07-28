@@ -14,120 +14,67 @@ A local Linux task execution daemon written in C++17.
 
 </div>
 
-`runnerd` is designed for a single user on a local Linux host. The
-`runnerctl` client communicates with the resident daemon over a Unix Domain
-Socket. The project will eventually support job submission, status queries,
-cancellation, timeouts, output capture, and job history recovery.
+`runnerd` is a single-host, single-user job execution service. The `runnerctl`
+client submits commands over a Unix Domain Socket, while the daemon starts,
+monitors, and reaps child processes.
 
 > [!IMPORTANT]
-> This project is in early development. The current version provides the Unix
-> Domain Socket transport, length-prefixed framing, a `PING/PONG` path, and an
-> `epoll` event loop with per-connection state and non-blocking output
-> buffering. It also defines the job data model, validation rules, and state
-> transitions. `runnerctl` can now submit jobs; the daemon validates each
-> request, assigns a JobId, and stores a `QUEUED` job in memory. Process
-> execution is not implemented yet, so submitted jobs do not run.
+> This project is still in early development. Jobs can now be submitted and
+> executed. Status queries, job listing, cancellation, timeout enforcement,
+> output retrieval, and persistence are planned for later versions.
 
 ## ✨ Features
 
-Currently implemented:
-
-- Local client/server communication over a Unix Domain Socket with a
-  configurable socket path
-- A 4-byte big-endian length-prefixed protocol with a 64 KiB payload limit
-- Incremental frame decoding for fragmented, coalesced, and binary payloads
+- Local communication over a Unix Domain Socket with a configurable path
 - A non-blocking, level-triggered `epoll` event loop for multiple clients
-- Independent decoder, output buffer, and close state for each connection
-- Safe socket-file lifecycle and handling for `EINTR`, `SIGPIPE`, and file
-  descriptor inheritance
-- `runnerctl ping` and `runnerctl submit` with an optional timeout
-- Job validation, JobId allocation, state transitions, and an in-memory
-  `QUEUED` job table
-- Unit and integration tests written with GoogleTest and run through CTest
+- Length-prefixed framing with incremental decoding for fragmented,
+  coalesced, and binary payloads
+- `ping` and `submit` commands with server-side job validation
+- Job startup through `fork/execve` in an independent process group, without
+  invoking a shell
+- stdout/stderr capture through non-blocking pipes and child reaping with
+  `signalfd + waitpid`
+- A job state machine, in-memory job table, and GoogleTest/CTest coverage
 
 ## 🏗️ Current Architecture
 
 ```text
-runnerctl ping
-      |
-      | Unix Domain Socket
-      | /tmp/runnerd.sock (default)
-      v
-   runnerd
-      |
-      `-- epoll_wait
-            |-- readable listen fd
-            |     `-- accept until EAGAIN
-            `-- client fd
-                  |-- Connection
-                  |     |-- FrameDecoder
-                  |     |-- output buffer
-                  |     |-- write offset
-                  |     `-- read closed
-                  |-- EPOLLIN
-                  |     `-- read -> decode -> queue response
-                  |-- EPOLLOUT
-                  |     `-- resume from the write offset
-                  `-- EPOLLRDHUP
-                        `-- drain final input -> flush output -> close
+runnerctl
+    |  Unix Domain Socket + length-prefixed protocol
+    v
+runnerd (epoll event loop)
+    |-- client fd ----------------> decode PING / SUBMIT, buffer responses
+    `-- ProcessMonitor
+          |-- process_launcher ---> fork / execve ---> child process
+          |-- process pipes ------------------------> capture output/startup errors
+          `-- signalfd ---> waitpid ----------------> update Job state
 ```
 
-The server stores connection state by file descriptor in a `Connections` map.
-Reads continue until `EAGAIN`; complete requests are decoded and their
-responses are appended to the output buffer. `EPOLLOUT` is registered only
-while output is pending. A partial write resumes from its saved offset on the
-next writable event, and `EPOLLOUT` is removed once the buffer is drained to
-avoid a busy loop.
+Network sockets and child-process pipes share the same `epoll` event loop.
+Disconnecting a client does not terminate its submitted jobs. `ProcessMonitor`
+settles a result only after the child has exited and every monitored pipe has
+reached EOF.
 
-The daemon handles a SUBMIT request as follows:
+### Current Limitations
 
-```text
-SUBMIT payload
-      |
-      |-- decodeSubmitRequest: recover timeout and argv
-      |-- validateJobSpec: check the absolute path, NUL bytes, and timeout
-      v
-Job{id, spec, state = QUEUED}
-      |
-      |-- store in Jobs[job_id]
-      `-- respond with "OK <job_id>"
-```
-
-The `Connections` map owns per-client I/O state and removes it when a
-connection closes. The `Jobs` map lives for the lifetime of the daemon, so a
-job remains after its submitting client disconnects. Jobs do not leave
-`QUEUED` yet. Restarting the daemon resets the next JobId to 1 and loses all
-in-memory jobs; later process-management and journal milestones will address
-these limitations.
+- `--timeout` is stored in `JobSpec` but is not enforced yet
+- There are no `status`, `list`, `cancel`, or output-query commands
+- There is no concurrency limit or waiting queue; valid jobs start immediately
+- Jobs and output live only in memory, with no output-size limit
+- Restarting the daemon loses the JobId counter, job states, and output
 
 ## 📁 Project Structure
 
-```text
-runnerd/
-|-- CMakeLists.txt
-|-- include/
-|   `-- runnerd/
-|       |-- job.h
-|       |-- protocol.h
-|       `-- unix_socket.h
-|-- src/
-|   |-- job.cpp
-|   |-- protocol.cpp
-|   |-- runnerd_main.cpp
-|   |-- runnerctl_main.cpp
-|   `-- unix_socket.cpp
-|-- tests/
-|   |-- job_test.cpp
-|   |-- protocol_test.cpp
-|   |-- runnerd_integration_test.cpp
-|   `-- smoke_test.cpp
-|-- docs/
-|   |-- requirements.md
-|   `-- state_machine.md
-|-- LICENSE
-|-- README.md
-`-- README_EN.md
-```
+| Module | Responsibility |
+| --- | --- |
+| `protocol` | Frame protocol and PING/SUBMIT encoding |
+| `job` | Job model, validation, and state machine |
+| `process_launcher` | Pipes, fork, redirection, process groups, and execve |
+| `process_monitor` | epoll registration, output capture, SIGCHLD, and settlement |
+| `unix_socket` | Unix Domain Socket creation and connection |
+| `runnerd_main` | Daemon entry point and event loop |
+| `runnerctl_main` | Command-line client |
+| `tests/` | Unit and end-to-end integration tests |
 
 ## 🚀 Build and Run
 
@@ -152,20 +99,6 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-The build produces:
-
-```text
-build/
-|-- librunnerd_job.a
-|-- librunnerd_protocol.a
-|-- job_test
-|-- protocol_test
-|-- runnerd
-|-- runnerd_integration_test
-|-- runnerctl
-`-- smoke_test
-```
-
 ### Run the Example
 
 Command syntax:
@@ -177,151 +110,73 @@ runnerctl [--socket <path>] submit [--timeout <milliseconds>] \
           -- <absolute-path> [arguments...]
 ```
 
-Start the server in the first terminal:
+Start the daemon in the first terminal:
 
 ```bash
 ./build/runnerd
 ```
 
-Expected output:
-
-```text
-runnerd is listening on /tmp/runnerd.sock
-```
-
-Send a request from a second terminal:
+Check the connection and submit a job from a second terminal:
 
 ```bash
-./build/runnerctl ping
+./build/runnerctl ping                         # prints PONG
+./build/runnerctl submit -- /bin/echo hello   # prints a JobId, such as 1
 ```
 
-Expected client output:
+Submit a job with a positive timeout configuration in milliseconds:
 
-```text
-PONG
+```bash
+./build/runnerctl submit --timeout 5000 -- /bin/sleep 1
 ```
 
-The server also prints:
-
-```text
-received PING
-```
-
-Both programs use `/tmp/runnerd.sock` when `--socket` is omitted. To use a
-different path, pass the same option to the server and client:
+Both programs use `/tmp/runnerd.sock` when `--socket` is omitted. For a custom
+path, pass the same option to the daemon and client:
 
 ```bash
 ./build/runnerd --socket /tmp/runnerd-demo.sock
 ./build/runnerctl --socket /tmp/runnerd-demo.sock ping
 ```
 
-Submit a job without a timeout:
-
-```bash
-./build/runnerctl submit -- /bin/echo hello
-```
-
-The client prints the daemon-assigned JobId:
-
-```text
-1
-```
-
-A positive timeout in milliseconds is optional:
-
-```bash
-./build/runnerctl submit --timeout 5000 -- /bin/sleep 1
-```
-
 The `--` delimiter ends `runnerctl` option parsing; everything after it is
 preserved as job argv. `argv[0]` must be an absolute path, so `echo hello` and
-`./echo hello` are rejected. The current version only stores `QUEUED` jobs and
-does not execute them; seeing no `hello` output after submitting `/bin/echo`
-is expected.
-
-If the server exits abnormally and leaves a stale socket file behind, the next
-startup using the same path checks and safely removes it.
+`./echo hello` are rejected. The daemon captures stdout/stderr, but the client
+cannot query it yet.
 
 ### Run the Tests
-
-All tests are written with GoogleTest. CMake's `gtest_discover_tests()`
-registers each GoogleTest case separately with CTest, so failures identify the
-specific case directly.
 
 ```bash
 cmake -E chdir build ctest --output-on-failure
 ```
 
-Alternatively, run CTest from the build directory:
-
-```bash
-cd build
-ctest --output-on-failure
-```
-
 The current test targets include:
 
-- `smoke_test`, which verifies that the basic test target builds and runs
-- `protocol_test`, which covers big-endian encoding, fragmented and coalesced
-  frames, empty and binary payloads, the 64 KiB boundary, SUBMIT round trips,
-  and malformed SUBMIT payloads
-- `job_test`, which covers valid and invalid job specifications, every legal
-  state transition, representative invalid transitions, terminal-state
-  detection, and the absolute program-path requirement
-- `runnerd_integration_test`, which starts a real daemon on an isolated
-  temporary socket and covers 20 concurrent PING clients, sequential JobId
-  allocation, positive timeout transport, relative-path rejection, and a
-  final PING after job submission
-
-Additional integration coverage for cross-event fragmentation, half-closes,
-and partial writes will be added in a later milestone.
+| Test target | Main coverage |
+| --- | --- |
+| `protocol_test` | Framing, boundaries, and malformed input |
+| `job_test` | Validation, state transitions, and terminal states |
+| `process_launcher_test` | fork/execve, pipes, process groups, and startup errors |
+| `process_monitor_test` | Output, settlement, large output, and concurrent reaping |
+| `runnerd_integration_test` | Real daemon, concurrent PING, and SUBMIT |
 
 ## 📡 Current Protocol
 
 Like TCP, a Unix Domain Stream Socket does not preserve message boundaries.
-The current protocol therefore uses a 4-byte big-endian length field to
-delimit each payload:
+The protocol uses a 4-byte big-endian length prefix and limits each payload to
+64 KiB:
 
 ```text
-+--------------------------+----------------------+
-| payload length (4 bytes) | variable payload     |
-| big-endian unsigned int  | up to 64 KiB         |
-+--------------------------+----------------------+
+[ payload length: uint32 big-endian ][ payload bytes ]
 ```
 
-The PING request and response payloads are:
+| Request | Successful response |
+| --- | --- |
+| `PING` | `PONG` |
+| `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
 
-```text
-request:  "PING"
-response: "PONG"
-```
-
-The SUBMIT request payload is:
-
-```text
-+----------------------+--------------------------------------+
-| field                | meaning                              |
-+----------------------+--------------------------------------+
-| "SUBMIT"             | 6-byte request marker                |
-| timeout_ms           | 4-byte big-endian integer; 0 = none  |
-| argc                 | 4-byte big-endian argument count     |
-| argument_length      | 4-byte big-endian argument length    |
-| argument             | raw argument bytes                   |
-| ...                  | repeat length and bytes per argument |
-+----------------------+--------------------------------------+
-```
-
-A successful submission returns `"OK <job_id>"`. Unknown requests and invalid
-SUBMIT payloads return `"ERR <message>"`. The client prints only the numeric
-JobId on success and writes errors to standard error.
-
-`FrameDecoder` accepts fragmented input across multiple calls and can extract
-multiple complete frames from one input buffer. Frames declaring payloads
-larger than 64 KiB are rejected. The daemon retains an independent decoder for
-each client, so a request may span multiple reads and multiple `epoll` events.
-Multiple complete requests received together are processed in order and each
-produces a response. Unknown requests receive an `ERR` response; malformed or
-oversized outer frames cause the server to close the corresponding connection.
+SUBMIT integers and argument lengths also use unsigned big-endian encoding;
+`timeout_ms = 0` means no timeout. Invalid requests return `ERR <message>`.
+`FrameDecoder` can assemble one frame across multiple reads and decode
+multiple frames from a single read.
 
 ## 🎯 Project Scope
 
@@ -347,8 +202,8 @@ non-blocking I/O, event loops, and honest crash recovery.
 - [x] Support multiple clients with non-blocking I/O, connection state, output
   buffering, and `epoll`
 - [x] Define the job model, validation, state-transition rules, and unit tests
-- [x] Add SUBMIT encoding, JobId allocation, and an in-memory `QUEUED` job table
-- [ ] Start jobs with `fork/execve` and capture stdout/stderr
+- [x] Add SUBMIT encoding, JobId allocation, and an in-memory job table
+- [x] Start jobs with `fork/execve` and capture stdout/stderr
 - [ ] Add the concurrency queue, cancellation, and timeouts
 - [ ] Persist job history in a journal and recover it after restart
 - [ ] Add more failure-path integration tests, Sanitizer checks, and
@@ -358,6 +213,7 @@ non-blocking I/O, event loops, and honest crash recovery.
 
 - [Requirements](docs/requirements.md)
 - [Job state machine](docs/state_machine.md)
+- [Process launcher](docs/process_launcher.md)
 
 ## 🤝 Contributing
 

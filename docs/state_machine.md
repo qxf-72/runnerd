@@ -2,8 +2,8 @@
 
 任务状态机用于限制任务生命周期中的状态变化。目前状态定义、迁移检查和
 单元测试已经实现，并已接入 SUBMIT 流程：每个合法提交都会创建一个初始
-状态为 `QUEUED` 的任务。任务执行流程尚未实现，因此运行时暂时不会发生
-后续状态迁移。
+状态为 `QUEUED` 的任务，然后由 `ProcessMonitor` 启动并根据子进程结果
+迁移到 `RUNNING`、`SUCCEEDED` 或 `FAILED`。
 
 ## 状态说明
 
@@ -22,12 +22,11 @@
 
 ```text
 QUEUED ────────> RUNNING ────────> SUCCEEDED
-   │                │ └──────────> FAILED
-   │                │
+   │                ├────────────> FAILED
    │                └────────────> TERMINATING ─────> CANCELLED
    │                                      └─────────> TIMED_OUT
-   │
-   └──────────> CANCELLED
+   ├──────────────> FAILED
+   └──────────────> CANCELLED
 
 QUEUED ────────────> INTERRUPTED
 RUNNING ───────────> INTERRUPTED
@@ -38,6 +37,7 @@ TERMINATING ───────> INTERRUPTED
 
 ```text
 QUEUED -> RUNNING
+QUEUED -> FAILED
 QUEUED -> CANCELLED
 QUEUED -> INTERRUPTED
 
@@ -54,6 +54,7 @@ TERMINATING -> INTERRUPTED
 ## 状态机规则
 
 - `QUEUED -> CANCELLED` 表示任务尚未启动时就被用户取消。
+- `QUEUED -> FAILED` 表示在进入运行状态前创建 pipe、fork 或监控注册失败。
 - 运行中的任务不能直接进入 `CANCELLED` 或 `TIMED_OUT`。runnerd 需要先
   请求终止子进程并进入 `TERMINATING`，等待子进程退出后再确定最终状态。
 - `TerminationCause` 记录进入 `TERMINATING` 的原因，目前分为用户取消和
@@ -74,16 +75,18 @@ TERMINATING -> INTERRUPTED
 - `validateJobSpec(spec)`：检查命令参数和超时设置；参数不合法时抛出
   `std::invalid_argument`。当前还要求 `argv[0]` 必须是绝对路径。
 
-当前 `transitionJob` 只负责校验并更新 `Job::state`，不会自动设置进程信息、
-终止原因、退出结果或错误信息。这些字段将在任务模型接入实际进程管理后由
-对应流程填写。
+`transitionJob` 只负责校验并更新 `Job::state`。`ProcessMonitor` 负责填写
+PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取消与超时功能
+接入后再填写终止原因。
 
 ## 当前运行时行为
 
 - 合法 SUBMIT 会分配 JobId，并创建一个 `QUEUED` 任务。
 - 任务保存在 daemon 级别的 `Jobs` 表中，不属于某一条客户端连接。
-- 客户端断开后任务仍然保留。
-- 因为尚未实现子进程启动，任务目前不会从 `QUEUED` 进入 `RUNNING`。
+- 客户端断开后任务仍然执行并保留。
+- 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
+  退出、信号终止或启动失败时进入 `FAILED`。
+- stdout/stderr 暂存在任务对象中，尚不能通过客户端查询。
 - 因为尚未实现 journal，daemon 重启后内存任务会丢失。
 
 ## 测试覆盖
@@ -92,6 +95,9 @@ TERMINATING -> INTERRUPTED
 
 - 不设置超时和设置正数超时的合法任务参数
 - 空 `argv`、空 `argv[0]`、相对程序路径、含 NUL 参数、零超时和负超时
-- 当前定义的全部 10 条合法迁移
+- 当前定义的全部 11 条合法迁移
 - 典型非法迁移，并验证拒绝后任务状态保持不变
 - 全部终态和非终态的判断
+
+`tests/process_monitor_test.cpp` 还覆盖成功执行、stdout/stderr 采集、
+execve 失败、非零退出、大输出排空和多个子进程同时回收。

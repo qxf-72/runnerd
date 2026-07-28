@@ -3,6 +3,10 @@
 `process_launcher` 只负责创建子进程和返回父进程需要管理的资源，
 不负责 epoll、waitpid、任务状态结算、超时或取消。
 
+返回的资源由 `ProcessMonitor` 接管：它把三个读端和 `signalfd` 注册到
+runnerd 的 epoll，持续采集输出，循环调用 `waitpid`，并在所有 pipe 到达
+EOF 且子进程退出后结算任务状态。
+
 ## fd 所有权
 
 | 资源 | 父进程保留 | 子进程保留 |
