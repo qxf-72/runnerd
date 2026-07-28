@@ -1,7 +1,6 @@
-#include <iostream>
+#include <gtest/gtest.h>
 
-int main()
-{
-    std::cout << "runnerd smoke test passed\n";
-    return 0;
+// 最小测试用于确认 GoogleTest 目标能够成功构建、发现并运行。
+TEST(SmokeTest, TestInfrastructureWorks) {
+  SUCCEED();
 }

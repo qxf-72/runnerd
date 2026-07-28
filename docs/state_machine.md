@@ -88,7 +88,7 @@ TERMINATING -> INTERRUPTED
 
 ## 测试覆盖
 
-`tests/job_test.cpp` 当前覆盖：
+`tests/job_test.cpp` 使用 GoogleTest，当前覆盖：
 
 - 不设置超时和设置正数超时的合法任务参数
 - 空 `argv`、空 `argv[0]`、相对程序路径、含 NUL 参数、零超时和负超时
