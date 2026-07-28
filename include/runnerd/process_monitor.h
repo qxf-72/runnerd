@@ -1,6 +1,8 @@
 #ifndef RUNNERD_PROCESS_MONITOR_H
 #define RUNNERD_PROCESS_MONITOR_H
 
+#include <sys/types.h>
+
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -41,6 +43,14 @@ class ProcessMonitor {
   };
 
   struct ActiveProcess {
+    ActiveProcess(pid_t child_pid, pid_t child_process_group_id, int child_stdout_fd,
+                  int child_stderr_fd, int child_startup_error_fd)
+        : pid(child_pid),
+          process_group_id(child_process_group_id),
+          stdout_fd(child_stdout_fd),
+          stderr_fd(child_stderr_fd),
+          startup_error_fd(child_startup_error_fd) {}
+
     pid_t pid = -1;
     pid_t process_group_id = -1;
 
