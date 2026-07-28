@@ -87,8 +87,9 @@ TEST(JobSpecTest, RejectsNegativeTimeout) {
 }
 
 TEST(JobStateTest, AllowsEveryDefinedValidTransition) {
-  const std::array<StateTransition, 10> transitions{{
+  const std::array<StateTransition, 11> transitions{{
       {runnerd::JobState::kQueued, runnerd::JobState::kRunning},
+      {runnerd::JobState::kQueued, runnerd::JobState::kFailed},
       {runnerd::JobState::kQueued, runnerd::JobState::kCancelled},
       {runnerd::JobState::kQueued, runnerd::JobState::kInterrupted},
       {runnerd::JobState::kRunning, runnerd::JobState::kSucceeded},

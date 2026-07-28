@@ -87,11 +87,36 @@ target_compile_definitions(runnerd_process PRIVATE
     _GNU_SOURCE
 )
 
+# 子进程 fd、SIGCHLD、输出采集和最终状态结算。
+add_library(runnerd_monitor STATIC
+    src/process_monitor.cpp
+)
+
+target_include_directories(runnerd_monitor PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(runnerd_monitor
+    PUBLIC
+        runnerd_job
+    PRIVATE
+        runnerd_process
+)
+
+target_compile_options(runnerd_monitor PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+target_compile_definitions(runnerd_monitor PRIVATE
+    _GNU_SOURCE
+)
+
 # 常驻任务执行服务。
 add_executable(runnerd
     src/runnerd_main.cpp
     src/unix_socket.cpp
-    src/process_monitor.cpp
 )
 
 target_include_directories(runnerd PRIVATE
@@ -100,8 +125,8 @@ target_include_directories(runnerd PRIVATE
 
 target_link_libraries(runnerd PRIVATE
     runnerd_fd_utils
+    runnerd_monitor
     runnerd_protocol
-    runnerd_process
 )
 
 target_compile_options(runnerd PRIVATE
@@ -236,7 +261,7 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 10
     )
 
-    # 独立验证进程启动器，暂时不要求 runnerd 接入任务执行。
+    # 独立验证进程启动器的 fork/execve、pipe 和进程组行为。
     add_executable(process_launcher_test
         tests/process_launcher_test.cpp
     )
@@ -254,6 +279,26 @@ if(BUILD_TESTING)
 
     gtest_discover_tests(
         process_launcher_test
+        PROPERTIES TIMEOUT 10
+    )
+
+    add_executable(process_monitor_test
+        tests/process_monitor_test.cpp
+    )
+
+    target_link_libraries(process_monitor_test PRIVATE
+        runnerd_monitor
+        GTest::gtest_main
+    )
+
+    target_compile_options(process_monitor_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+
+    gtest_discover_tests(
+        process_monitor_test
         PROPERTIES TIMEOUT 10
     )
 endif()
