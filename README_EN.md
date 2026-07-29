@@ -18,10 +18,8 @@ A local Linux task execution daemon written in C++17.
 client submits commands over a Unix Domain Socket, while the daemon starts,
 monitors, and reaps child processes.
 
-> [!IMPORTANT]
-> This project is still in early development. Jobs can now be submitted and
-> executed. Status queries, job listing, cancellation, timeout enforcement,
-> output retrieval, and persistence are planned for later versions.
+> [!NOTE]
+> This project is still in early development, and its protocol and CLI may change.
 
 ## ✨ Features
 
@@ -29,7 +27,7 @@ monitors, and reaps child processes.
 - A non-blocking, level-triggered `epoll` event loop for multiple clients
 - Length-prefixed framing with incremental decoding for fragmented,
   coalesced, and binary payloads
-- `ping` and `submit` commands with server-side job validation
+- `ping`, `submit`, `status`, and `list` commands with server-side validation
 - Job startup through `fork/execve` in an independent process group, without
   invoking a shell
 - stdout/stderr capture through non-blocking pipes and child reaping with
@@ -43,7 +41,7 @@ runnerctl
     |  Unix Domain Socket + length-prefixed protocol
     v
 runnerd (epoll event loop)
-    |-- client fd ----------------> decode PING / SUBMIT, buffer responses
+    |-- client fd ----------------> decode requests, query jobs, buffer responses
     `-- ProcessMonitor
           |-- process_launcher ---> fork / execve ---> child process
           |-- process pipes ------------------------> capture output/startup errors
@@ -58,7 +56,7 @@ reached EOF.
 ### Current Limitations
 
 - `--timeout` is stored in `JobSpec` but is not enforced yet
-- There are no `status`, `list`, `cancel`, or output-query commands
+- There are no `cancel` or output-query commands
 - There is no concurrency limit or waiting queue; valid jobs start immediately
 - Jobs and output live only in memory, with no output-size limit
 - Restarting the daemon loses the JobId counter, job states, and output
@@ -67,7 +65,7 @@ reached EOF.
 
 | Module | Responsibility |
 | --- | --- |
-| `protocol` | Frame protocol and PING/SUBMIT encoding |
+| `protocol` | Framing and PING/SUBMIT/STATUS encoding |
 | `job` | Job model, validation, and state machine |
 | `process_launcher` | Pipes, fork, redirection, process groups, and execve |
 | `process_monitor` | epoll registration, output capture, SIGCHLD, and settlement |
@@ -108,6 +106,8 @@ runnerd [--socket <path>]
 runnerctl [--socket <path>] ping
 runnerctl [--socket <path>] submit [--timeout <milliseconds>] \
           -- <absolute-path> [arguments...]
+runnerctl [--socket <path>] status <job_id>
+runnerctl [--socket <path>] list
 ```
 
 Start the daemon in the first terminal:
@@ -127,6 +127,13 @@ Submit a job with a positive timeout configuration in milliseconds:
 
 ```bash
 ./build/runnerctl submit --timeout 5000 -- /bin/sleep 1
+```
+
+Query one job or list every in-memory job:
+
+```bash
+./build/runnerctl status 1
+./build/runnerctl list
 ```
 
 Both programs use `/tmp/runnerd.sock` when `--socket` is omitted. For a custom
@@ -152,11 +159,11 @@ The current test targets include:
 
 | Test target | Main coverage |
 | --- | --- |
-| `protocol_test` | Framing, boundaries, and malformed input |
+| `protocol_test` | Framing, SUBMIT/STATUS encoding, and malformed input |
 | `job_test` | Validation, state transitions, and terminal states |
 | `process_launcher_test` | fork/execve, pipes, process groups, and startup errors |
 | `process_monitor_test` | Output, settlement, large output, and concurrent reaping |
-| `runnerd_integration_test` | Real daemon, concurrent PING, and SUBMIT |
+| `runnerd_integration_test` | Real daemon, concurrent PING, SUBMIT, STATUS, and LIST |
 
 ## 📡 Current Protocol
 
@@ -172,11 +179,13 @@ The protocol uses a 4-byte big-endian length prefix and limits each payload to
 | --- | --- |
 | `PING` | `PONG` |
 | `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
+| `STATUS + job_id` | `OK id=<id> state=<state> ...` |
+| `LIST` | `OK` followed by JobId-sorted summaries |
 
 SUBMIT integers and argument lengths also use unsigned big-endian encoding;
-`timeout_ms = 0` means no timeout. Invalid requests return `ERR <message>`.
-`FrameDecoder` can assemble one frame across multiple reads and decode
-multiple frames from a single read.
+`timeout_ms = 0` means no timeout. STATUS uses an 8-byte unsigned big-endian
+JobId. Invalid requests return `ERR <message>`. `FrameDecoder` can assemble one
+frame across multiple reads and decode multiple frames from a single read.
 
 ## 🎯 Project Scope
 
@@ -204,6 +213,7 @@ non-blocking I/O, event loops, and honest crash recovery.
 - [x] Define the job model, validation, state-transition rules, and unit tests
 - [x] Add SUBMIT encoding, JobId allocation, and an in-memory job table
 - [x] Start jobs with `fork/execve` and capture stdout/stderr
+- [x] Add STATUS and LIST job queries
 - [ ] Add the concurrency queue, cancellation, and timeouts
 - [ ] Persist job history in a journal and recover it after restart
 - [ ] Add more failure-path integration tests, Sanitizer checks, and
