@@ -14,6 +14,10 @@ namespace {
 constexpr char kSubmitCommand[] = "SUBMIT";
 constexpr std::size_t kSubmitCommandSize = sizeof(kSubmitCommand) - 1;
 
+constexpr char kStatusCommand[] = "STATUS";
+constexpr std::size_t kStatusCommandSize = sizeof(kStatusCommand) - 1;
+constexpr std::size_t kStatusRequestSize = kStatusCommandSize + sizeof(JobId);
+
 // 将 uint32_t 以大端序追加到字符串。
 // std::string 可以保存 '\0'，因此可以作为二进制缓冲区。
 void appendUint32(std::string& output, std::uint32_t value) {
@@ -36,6 +40,17 @@ std::uint32_t readUint32(const std::string& input, std::size_t& offset) {
   offset += sizeof(network_value);
 
   return ::ntohl(network_value);
+}
+
+// POSIX 没有提供通用的 htonll()，因此手动将 uint64_t JobId
+// 按照最高字节在前的顺序写入 payload。
+void appendJobId(std::string& output, JobId job_id) {
+  for (std::size_t index = 0; index < sizeof(JobId); ++index) {
+    const std::size_t shift = (sizeof(JobId) - index - 1U) * 8U;
+    const auto byte = static_cast<char>((job_id >> shift) & 0xffU);
+
+    output.push_back(byte);
+  }
 }
 
 }  // namespace
@@ -160,6 +175,49 @@ JobSpec decodeSubmitRequest(const std::string& payload) {
   // 解码只负责二进制结构。
   // 服务端接下来还要调用 validateJobSpec()。
   return spec;
+}
+
+bool isStatusRequest(const std::string& payload) {
+  return payload.size() >= kStatusCommandSize &&
+         payload.compare(0, kStatusCommandSize, kStatusCommand) == 0;
+}
+
+std::string encodeStatusRequest(JobId job_id) {
+  if (job_id == 0) {
+    throw std::invalid_argument("job id must be greater than zero");
+  }
+
+  std::string payload;
+  payload.reserve(kStatusRequestSize);
+
+  payload.append(kStatusCommand, kStatusCommandSize);
+  appendJobId(payload, job_id);
+
+  return payload;
+}
+
+JobId decodeStatusRequest(const std::string& payload) {
+  if (!isStatusRequest(payload)) {
+    throw std::invalid_argument("payload is not a STATUS request");
+  }
+
+  if (payload.size() != kStatusRequestSize) {
+    throw std::invalid_argument("STATUS request has invalid size");
+  }
+
+  JobId job_id = 0;
+
+  for (std::size_t index = kStatusCommandSize; index < payload.size(); ++index) {
+    const auto byte = static_cast<unsigned char>(payload[index]);
+
+    job_id = (job_id << 8U) | static_cast<JobId>(byte);
+  }
+
+  if (job_id == 0) {
+    throw std::invalid_argument("job id must be greater than zero");
+  }
+
+  return job_id;
 }
 
 std::vector<char> encodeFrame(const std::string& payload) {

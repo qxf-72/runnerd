@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
@@ -157,11 +158,104 @@ void acceptClients(int listen_fd, int epoll_fd, Connections& connections) {
   }
 }
 
+// STATUS 返回单个任务的详细摘要，但暂时不返回 stdout/stderr 内容。
+std::string formatJobStatus(const runnerd::Job& job) {
+  std::string result =
+      "id=" + std::to_string(job.id) + " state=" + std::string(runnerd::jobStateName(job.state));
+
+  if (job.spec.execution_timeout.has_value()) {
+    result += " timeout_ms=" + std::to_string(job.spec.execution_timeout->count());
+  }
+
+  if (job.pid.has_value()) {
+    result += " pid=" + std::to_string(*job.pid);
+  }
+
+  if (job.exit_code.has_value()) {
+    result += " exit_code=" + std::to_string(*job.exit_code);
+  }
+
+  if (job.exit_signal.has_value()) {
+    result += " exit_signal=" + std::to_string(*job.exit_signal);
+  }
+
+  // ProcessMonitor 在任务最终结算时才把活动进程缓冲区移动到 Job，
+  // 因此只有终态任务的输出大小是完整、可信的。
+  if (runnerd::isTerminal(job.state)) {
+    result += " stdout_bytes=" + std::to_string(job.standard_output.size());
+    result += " stderr_bytes=" + std::to_string(job.standard_error.size());
+  }
+
+  if (!job.failure_message.empty()) {
+    result += " error=" + job.failure_message;
+  }
+
+  return result;
+}
+
+std::string makeStatusResponse(const runnerd::Job& job) {
+  const std::string response = "OK " + formatJobStatus(job);
+
+  if (response.size() > runnerd::kMaxFrameSize) {
+    return "ERR status response exceeds maximum frame size";
+  }
+
+  return response;
+}
+
+std::string makeListResponse(const Jobs& jobs) {
+  // unordered_map 的遍历顺序不稳定，先对 JobId 排序以获得稳定输出。
+  std::vector<runnerd::JobId> job_ids;
+  job_ids.reserve(jobs.size());
+
+  for (const auto& entry : jobs) {
+    job_ids.push_back(entry.first);
+  }
+
+  std::sort(job_ids.begin(), job_ids.end());
+
+  std::string response = "OK";
+
+  for (const runnerd::JobId job_id : job_ids) {
+    const runnerd::Job& job = jobs.at(job_id);
+    const std::string line = "\nid=" + std::to_string(job.id) +
+                             " state=" + std::string(runnerd::jobStateName(job.state));
+
+    // LIST 尚未设计分页。超过单帧上限时返回明确错误，不能返回残缺列表。
+    if (line.size() > runnerd::kMaxFrameSize - response.size()) {
+      return "ERR too many jobs to list";
+    }
+
+    response += line;
+  }
+
+  return response;
+}
+
 std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id,
                           runnerd::ProcessMonitor& process_monitor) {
   if (request == "PING") {
     std::cout << "received PING\n";
     return "PONG";
+  }
+
+  if (request == "LIST") {
+    return makeListResponse(jobs);
+  }
+
+  if (runnerd::isStatusRequest(request)) {
+    try {
+      const runnerd::JobId job_id = runnerd::decodeStatusRequest(request);
+      const auto iterator = jobs.find(job_id);
+
+      if (iterator == jobs.end()) {
+        return "ERR job not found";
+      }
+
+      return makeStatusResponse(iterator->second);
+    } catch (const std::invalid_argument& exception) {
+      return std::string("ERR ") + exception.what();
+    }
   }
 
   if (!runnerd::isSubmitRequest(request)) {

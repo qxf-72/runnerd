@@ -24,6 +24,8 @@ constexpr const char* kDefaultSocketPath = "/tmp/runnerd.sock";
 enum class Command {
   kPing,
   kSubmit,
+  kStatus,
+  kList,
 };
 
 struct CommandLine {
@@ -32,6 +34,9 @@ struct CommandLine {
   Command command = Command::kPing;
 
   runnerd::JobSpec job_spec;
+
+  // 只在 status 命令中使用。
+  runnerd::JobId job_id = 0;
 };
 
 void printUsage(const char* program_name) {
@@ -39,7 +44,9 @@ void printUsage(const char* program_name) {
             << "  " << program_name << " [--socket <path>] ping\n"
             << "  " << program_name << " [--socket <path>] submit "
             << "[--timeout <milliseconds>] "
-            << "-- <absolute-path> [arguments...]\n";
+            << "-- <absolute-path> [arguments...]\n"
+            << "  " << program_name << " [--socket <path>] status <job_id>\n"
+            << "  " << program_name << " [--socket <path>] list\n";
 }
 
 // 只接受十进制正整数，并在计算过程中检查 uint32_t 溢出。
@@ -81,6 +88,40 @@ bool parsePositiveTimeout(const std::string& text, runnerd::JobTimeout& timeout,
   return true;
 }
 
+bool parseJobId(const std::string& text, runnerd::JobId& job_id, std::string& error) {
+  if (text.empty()) {
+    error = "job id must not be empty";
+    return false;
+  }
+
+  runnerd::JobId value = 0;
+  const runnerd::JobId maximum = std::numeric_limits<runnerd::JobId>::max();
+
+  for (const char character : text) {
+    if (character < '0' || character > '9') {
+      error = "job id must be a positive integer";
+      return false;
+    }
+
+    const runnerd::JobId digit = static_cast<runnerd::JobId>(character - '0');
+
+    if (value > (maximum - digit) / 10U) {
+      error = "job id is too large";
+      return false;
+    }
+
+    value = value * 10U + digit;
+  }
+
+  if (value == 0) {
+    error = "job id must be greater than zero";
+    return false;
+  }
+
+  job_id = value;
+  return true;
+}
+
 bool parseCommandLine(int argc, char* argv[], CommandLine& command_line, std::string& error) {
   command_line = CommandLine{};
 
@@ -114,6 +155,39 @@ bool parseCommandLine(int argc, char* argv[], CommandLine& command_line, std::st
       error =
           "ping does not accept "
           "additional arguments";
+      return false;
+    }
+
+    return true;
+  }
+
+  if (command == "list") {
+    command_line.command = Command::kList;
+
+    if (index != argc) {
+      error = "list does not accept additional arguments";
+      return false;
+    }
+
+    return true;
+  }
+
+  if (command == "status") {
+    command_line.command = Command::kStatus;
+
+    if (index >= argc) {
+      error = "status requires a job id";
+      return false;
+    }
+
+    if (!parseJobId(argv[index], command_line.job_id, error)) {
+      return false;
+    }
+
+    ++index;
+
+    if (index != argc) {
+      error = "status accepts exactly one job id";
       return false;
     }
 
@@ -176,6 +250,21 @@ bool parseCommandLine(int argc, char* argv[], CommandLine& command_line, std::st
   }
 
   return true;
+}
+
+std::string makeRequestPayload(const CommandLine& command_line) {
+  switch (command_line.command) {
+    case Command::kPing:
+      return "PING";
+    case Command::kSubmit:
+      return runnerd::encodeSubmitRequest(command_line.job_spec);
+    case Command::kStatus:
+      return runnerd::encodeStatusRequest(command_line.job_id);
+    case Command::kList:
+      return "LIST";
+  }
+
+  throw std::logic_error("unknown command");
 }
 
 bool writeAll(int fd, const void* buffer, std::size_t size) {
@@ -282,26 +371,54 @@ bool handleResponse(Command command, const std::string& response) {
     return false;
   }
 
-  if (command == Command::kPing) {
-    if (response != "PONG") {
-      std::cerr << "unexpected response: " << response << '\n';
-      return false;
+  switch (command) {
+    case Command::kPing:
+      if (response != "PONG") {
+        std::cerr << "unexpected response: " << response << '\n';
+        return false;
+      }
+
+      std::cout << "PONG\n";
+      return true;
+
+    case Command::kSubmit: {
+      runnerd::JobId job_id = 0;
+
+      if (!parseSubmitSuccessResponse(response, job_id)) {
+        std::cerr << "unexpected response: " << response << '\n';
+        return false;
+      }
+
+      // stdout 只打印 JobId，便于脚本捕获。
+      std::cout << job_id << '\n';
+      return true;
     }
 
-    std::cout << "PONG\n";
-    return true;
+    case Command::kStatus:
+      if (response.size() <= 3 || response.compare(0, 3, "OK ") != 0) {
+        std::cerr << "unexpected response: " << response << '\n';
+        return false;
+      }
+
+      std::cout << response.substr(3) << '\n';
+      return true;
+
+    case Command::kList:
+      if (response == "OK") {
+        std::cout << "No jobs\n";
+        return true;
+      }
+
+      if (response.compare(0, 3, "OK\n") != 0) {
+        std::cerr << "unexpected response: " << response << '\n';
+        return false;
+      }
+
+      std::cout << response.substr(3) << '\n';
+      return true;
   }
 
-  runnerd::JobId job_id = 0;
-
-  if (!parseSubmitSuccessResponse(response, job_id)) {
-    std::cerr << "unexpected response: " << response << '\n';
-    return false;
-  }
-
-  // stdout 只打印 JobId，便于脚本捕获。
-  std::cout << job_id << '\n';
-  return true;
+  return false;
 }
 
 }  // namespace
@@ -324,13 +441,7 @@ int main(int argc, char* argv[]) {
   try {
     socket_fd = runnerd::connectUnixSocket(command_line.socket_path);
 
-    std::string request_payload;
-
-    if (command_line.command == Command::kPing) {
-      request_payload = "PING";
-    } else {
-      request_payload = runnerd::encodeSubmitRequest(command_line.job_spec);
-    }
+    const std::string request_payload = makeRequestPayload(command_line);
 
     const std::vector<char> request = runnerd::encodeFrame(request_payload);
 

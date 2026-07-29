@@ -364,4 +364,84 @@ TEST_F(RunnerdIntegrationTest, SubmitsJobsAndKeepsServingRequests) {
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
+TEST_F(RunnerdIntegrationTest, ListsNoJobsBeforeSubmission) {
+  const ChildResult result = runClient({"list"});
+
+  ASSERT_EQ(result.exit_code, 0) << result.standard_error;
+  EXPECT_EQ(result.standard_output, "No jobs\n");
+}
+
+TEST_F(RunnerdIntegrationTest, RejectsInvalidStatusAndListArguments) {
+  const ChildResult zero_id = runClient({"status", "0"});
+  EXPECT_NE(zero_id.exit_code, 0);
+  EXPECT_NE(zero_id.standard_error.find("greater than zero"), std::string::npos);
+
+  const ChildResult invalid_id = runClient({"status", "abc"});
+  EXPECT_NE(invalid_id.exit_code, 0);
+  EXPECT_NE(invalid_id.standard_error.find("positive integer"), std::string::npos);
+
+  const ChildResult extra_status_argument = runClient({"status", "1", "extra"});
+  EXPECT_NE(extra_status_argument.exit_code, 0);
+  EXPECT_NE(extra_status_argument.standard_error.find("exactly one"), std::string::npos);
+
+  const ChildResult extra_list_argument = runClient({"list", "extra"});
+  EXPECT_NE(extra_list_argument.exit_code, 0);
+  EXPECT_NE(extra_list_argument.standard_error.find("does not accept"), std::string::npos);
+}
+
+TEST_F(RunnerdIntegrationTest, ReportsStatusAndListsJobsInIdOrder) {
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/echo", "hello"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  EXPECT_EQ(first_submit.standard_output, "1\n");
+
+  // echo 可能在第一次 STATUS 到达时仍为 RUNNING，因此轮询等待终态。
+  ChildResult status;
+  bool completed = false;
+
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    status = runClient({"status", "1"});
+
+    ASSERT_EQ(status.exit_code, 0) << status.standard_error;
+
+    if (status.standard_output.find("state=SUCCEEDED") != std::string::npos) {
+      completed = true;
+      break;
+    }
+
+    ::usleep(20'000);
+  }
+
+  ASSERT_TRUE(completed) << "last status: " << status.standard_output << "\nserver log:\n"
+                         << readServerLog();
+
+  EXPECT_NE(status.standard_output.find("id=1"), std::string::npos);
+  EXPECT_NE(status.standard_output.find("exit_code=0"), std::string::npos);
+  EXPECT_NE(status.standard_output.find("stdout_bytes=6"), std::string::npos);
+
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "1"});
+
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  EXPECT_EQ(second_submit.standard_output, "2\n");
+
+  const ChildResult list = runClient({"list"});
+
+  ASSERT_EQ(list.exit_code, 0) << list.standard_error;
+
+  const std::size_t first_position = list.standard_output.find("id=1 state=");
+  const std::size_t second_position = list.standard_output.find("id=2 state=");
+
+  ASSERT_NE(first_position, std::string::npos);
+  ASSERT_NE(second_position, std::string::npos);
+
+  // LIST 不应依赖 unordered_map 不稳定的遍历顺序。
+  EXPECT_LT(first_position, second_position);
+
+  const ChildResult missing = runClient({"status", "999"});
+
+  EXPECT_NE(missing.exit_code, 0);
+  EXPECT_NE(missing.standard_error.find("job not found"), std::string::npos);
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
 }  // namespace

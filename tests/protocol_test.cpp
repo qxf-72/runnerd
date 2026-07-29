@@ -98,6 +98,44 @@ TEST(SubmitProtocolTest, RejectsMalformedPayloads) {
   EXPECT_THROW(runnerd::decodeSubmitRequest(trailing_bytes), std::invalid_argument);
 }
 
+TEST(StatusProtocolTest, RoundTripsBigEndianJobId) {
+  const runnerd::JobId job_id = static_cast<runnerd::JobId>(0x0102030405060708ULL);
+
+  const std::string payload = runnerd::encodeStatusRequest(job_id);
+
+  ASSERT_EQ(payload.size(), 14U);
+  EXPECT_EQ(payload.compare(0, 6, "STATUS"), 0);
+
+  EXPECT_EQ(static_cast<unsigned char>(payload[6]), 0x01U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[7]), 0x02U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[8]), 0x03U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[9]), 0x04U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[10]), 0x05U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[11]), 0x06U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[12]), 0x07U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[13]), 0x08U);
+
+  EXPECT_TRUE(runnerd::isStatusRequest(payload));
+  EXPECT_EQ(runnerd::decodeStatusRequest(payload), job_id);
+}
+
+TEST(StatusProtocolTest, RejectsMalformedRequests) {
+  EXPECT_THROW(runnerd::encodeStatusRequest(0), std::invalid_argument);
+  EXPECT_THROW(runnerd::decodeStatusRequest("STATUS"), std::invalid_argument);
+
+  std::string zero_job_id("STATUS", 6);
+  zero_job_id.append(sizeof(runnerd::JobId), '\0');
+  EXPECT_THROW(runnerd::decodeStatusRequest(zero_job_id), std::invalid_argument);
+
+  std::string trailing_bytes = runnerd::encodeStatusRequest(1);
+  trailing_bytes.push_back('x');
+  EXPECT_THROW(runnerd::decodeStatusRequest(trailing_bytes), std::invalid_argument);
+
+  std::string wrong_marker = runnerd::encodeStatusRequest(1);
+  wrong_marker[0] = 'X';
+  EXPECT_THROW(runnerd::decodeStatusRequest(wrong_marker), std::invalid_argument);
+}
+
 TEST(FrameEncodingTest, UsesBigEndianPayloadLength) {
   const std::vector<char> frame = runnerd::encodeFrame("PING");
 

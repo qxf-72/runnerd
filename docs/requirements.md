@@ -19,8 +19,9 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 `runnerctl` 已支持提交任务。runnerd 会解码并校验 `JobSpec`、分配 JobId，
 将任务保存到内存表并立即使用 `fork/execve` 启动。stdout/stderr 通过
 非阻塞 pipe 接入 `epoll`，`SIGCHLD` 通过 `signalfd` 接入事件循环，退出
-结果由 `waitpid` 结算。当前没有 `status`、`list` 和 `cancel` 命令，
-也没有并发上限；daemon 重启后内存任务、输出及 JobId 计数都会丢失。
+结果由 `waitpid` 结算。`status` 可以查询单个任务，`list` 会按 JobId
+顺序列出内存中的任务。当前没有 `cancel` 命令和并发上限；daemon 重启后
+内存任务、输出及 JobId 计数都会丢失。
 
 ## 第一阶段核心功能
 
@@ -30,7 +31,8 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - [x] 4 字节大端长度前缀协议
 - [x] 非阻塞 `epoll` 多连接事件循环
 - [x] SUBMIT 请求、响应和 argv 长度字段编解码
-- [ ] 查询、列表和取消任务的协议消息
+- [x] 查询和列表任务的协议消息
+- [ ] 取消任务的协议消息
 
 ### 任务模型与执行
 
@@ -55,6 +57,7 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - [x] 任务模型单元测试
 - [x] 20 个并发客户端的 `PING/PONG` 集成测试
 - [x] SUBMIT 编解码和顺序提交集成测试
+- [x] STATUS 编解码及 STATUS/LIST 集成测试
 - [x] 进程启动、输出采集、execve 失败和并发回收测试
 - [ ] 任务取消、超时和恢复的集成测试
 

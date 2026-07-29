@@ -24,6 +24,15 @@ std::string encodeSubmitRequest(const JobSpec& spec);
 // 这里只检查二进制结构，不负责服务端业务校验。
 JobSpec decodeSubmitRequest(const std::string& payload);
 
+// 判断 payload 是否使用 STATUS 请求格式。
+bool isStatusRequest(const std::string& payload);
+
+// 将 JobId 编码为 STATUS payload。
+std::string encodeStatusRequest(JobId job_id);
+
+// 从 STATUS payload 中还原 JobId。
+JobId decodeStatusRequest(const std::string& payload);
+
 // 将 payload 编码为“4 字节大端长度 + payload”。
 std::vector<char> encodeFrame(const std::string& payload);
 
