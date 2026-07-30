@@ -444,4 +444,39 @@ TEST_F(RunnerdIntegrationTest, ReportsStatusAndListsJobsInIdOrder) {
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
+TEST_F(RunnerdIntegrationTest, ReportsNonzeroExitAndCapturedOutputForFailedJob) {
+  const ChildResult submit =
+      runClient({"submit", "--", "/bin/sh", "-c", "printf out; printf err >&2; exit 7"});
+
+  ASSERT_EQ(submit.exit_code, 0) << submit.standard_error;
+  EXPECT_EQ(submit.standard_output, "1\n");
+
+  // SUBMIT 响应可能早于子进程退出，轮询到 FAILED 后再检查最终结果。
+  ChildResult status;
+  bool failed = false;
+
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    status = runClient({"status", "1"});
+
+    ASSERT_EQ(status.exit_code, 0) << status.standard_error;
+
+    if (status.standard_output.find("state=FAILED") != std::string::npos) {
+      failed = true;
+      break;
+    }
+
+    ::usleep(20'000);
+  }
+
+  ASSERT_TRUE(failed) << "last status: " << status.standard_output << "\nserver log:\n"
+                      << readServerLog();
+
+  EXPECT_NE(status.standard_output.find("id=1"), std::string::npos);
+  EXPECT_NE(status.standard_output.find("exit_code=7"), std::string::npos);
+  EXPECT_NE(status.standard_output.find("stdout_bytes=3"), std::string::npos);
+  EXPECT_NE(status.standard_output.find("stderr_bytes=3"), std::string::npos);
+  EXPECT_NE(status.standard_output.find("error=process exited with code 7"), std::string::npos);
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
 }  // namespace
