@@ -2,74 +2,44 @@
 
 # runnerd
 
+**一个用于启动、监管和查询本地任务的事件驱动 Linux 守护服务。**
+
 [English](README_EN.md) | 简体中文
 
-一个使用 C++17 编写的 Linux 本地任务执行守护服务。
-
-![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B&logoColor=white)
 ![CMake](https://img.shields.io/badge/CMake-3.16%2B-064F8C?logo=cmake)
 ![Platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
-![Status](https://img.shields.io/badge/status-early%20development-orange)
+![Status](https://img.shields.io/badge/status-experimental-orange)
 [![License](https://img.shields.io/github/license/qxf-72/runnerd)](LICENSE)
+
+[快速开始](#-快速开始) · [架构](#-架构) · [文档](#-文档) · [路线图](#-路线图)
 
 </div>
 
-`runnerd` 是一个面向单机、单用户场景的任务执行服务。客户端 `runnerctl`
-通过 Unix Domain Socket 提交命令，daemon 负责启动、监控并回收子进程。
+`runnerd` 是一个面向单机、单用户场景的任务执行服务。客户端
+`runnerctl` 通过 Unix Domain Socket 提交命令，daemon 负责启动、监控和回收
+对应的子进程。
 
-> [!NOTE]
-> 项目仍处于早期开发阶段，协议和命令行接口可能继续调整。
+> [!WARNING]
+> **实验性软件。** `runnerd` 仅适用于可信的单用户 Linux 环境。目前没有认证、
+> 沙箱隔离、持久化、真正生效的执行超时机制，也没有输出大小限制；请勿将其暴露给
+> 不受信任的用户或工作负载。
 
-## ✨ 功能特性
+## ✨ 为什么选择 runnerd？
 
-- Unix Domain Socket 本地通信，支持自定义 socket 路径
-- 基于非阻塞 I/O 和 LT `epoll` 的多客户端事件循环
-- 长度前缀协议与增量解码，正确处理拆包、粘包和二进制 payload
-- 支持 `ping`、`submit`、`status` 和 `list`，服务端会再次校验请求
-- 使用 `fork/execve` 和独立进程组启动任务，不经过 shell
-- 通过非阻塞 pipe 采集 stdout/stderr，使用 `signalfd + waitpid` 回收子进程
-- 提供任务状态机、内存任务表以及 GoogleTest/CTest 测试
+`runnerd` 将进程监管保持在本机，并把关键行为显式化。它是一个聚焦 Linux
+进程管理的参考实现，而不是通用调度器或远程执行平台。
 
-## 🏗️ 当前架构
-
-```text
-runnerctl
-    │  Unix Domain Socket + 长度前缀协议
-    ▼
-runnerd（epoll 事件循环）
-    ├── client fd ──────────────> 解码请求、查询任务并缓冲响应
-    └── ProcessMonitor
-          ├── process_launcher ─> fork / execve ─> 子进程
-          ├── process pipes ─────────────────────> 采集输出与启动错误
-          └── signalfd ─> waitpid ──────────────> 更新 Job 状态
-```
-
-网络连接和子进程 pipe 共用同一个 `epoll` 事件循环。客户端断开不会终止
-已经提交的任务；任务结果由 `ProcessMonitor` 在子进程退出且三个监控 pipe
-全部到达 EOF 后统一结算。
-
-### 当前限制
-
-- `--timeout` 只会保存到 `JobSpec`，暂时不会终止超时任务
-- 没有 `cancel` 和输出查询命令
-- 没有并发上限或等待队列，合法任务会立即启动
-- 任务和输出只保存在内存中，当前也没有输出大小上限
-- daemon 重启后会丢失 JobId 计数、任务状态和输出
-
-## 📁 项目结构
-
-| 模块 | 职责 |
+| 能力 | 提供的价值 |
 | --- | --- |
-| `protocol` | 长度前缀帧及 SUBMIT/STATUS 编解码 |
-| `job` | 任务模型、参数校验和状态机 |
-| `process_launcher` | pipe、fork、重定向、进程组和 execve |
-| `process_monitor` | epoll 注册、输出采集、SIGCHLD 和任务结算 |
-| `unix_socket` | Unix Domain Socket 创建与连接 |
-| `runnerd_main` | daemon 入口与事件循环 |
-| `runnerctl_main` | 命令行客户端 |
-| `tests/` | 单元测试和端到端集成测试 |
+| 本地 IPC | 使用可自定义路径的 Unix Domain Socket；socket 文件以 `0600` 权限创建。 |
+| 事件驱动 I/O | 一个 LT `epoll` 事件循环同时服务客户端与子进程管道，不阻塞主循环。 |
+| 可靠分帧 | 长度前缀协议和增量解码正确处理拆包、粘包及二进制 payload。 |
+| 进程监管 | 通过 `fork/execve` 和独立进程组启动任务，全程不经过 shell。 |
+| 可观测生命周期 | `signalfd + waitpid` 配合非阻塞 stdout/stderr 管道，驱动有文档说明的任务状态机。 |
+| 可验证行为 | GoogleTest 与 CTest 覆盖协议、状态转移、进程启动、监控和端到端流程。 |
 
-## 🚀 编译运行
+## 🚀 快速开始
 
 ### 环境要求
 
@@ -77,32 +47,19 @@ runnerd（epoll 事件循环）
 - 支持 C++17 的 GCC 或 Clang
 - CMake 3.16 或更高版本
 
-测试使用 GoogleTest 1.17.0。首次启用测试进行 CMake 配置时，
-`FetchContent` 会自动下载并校验对应源码，因此需要能够访问 GitHub；
-后续配置会复用构建目录中已经下载的依赖。
-
-### 构建项目
+### 构建
 
 ```bash
 git clone https://github.com/qxf-72/runnerd.git
 cd runnerd
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
-### 运行示例
+首次配置会通过 `FetchContent` 下载 GoogleTest，因此需要能够访问 GitHub。
 
-命令格式：
-
-```text
-runnerd [--socket <path>]
-runnerctl [--socket <path>] ping
-runnerctl [--socket <path>] submit [--timeout <milliseconds>] \
-          -- <absolute-path> [arguments...]
-runnerctl [--socket <path>] status <job_id>
-runnerctl [--socket <path>] list
-```
+### 运行任务
 
 在第一个终端启动 daemon：
 
@@ -110,125 +67,223 @@ runnerctl [--socket <path>] list
 ./build/runnerd
 ```
 
-在第二个终端检查连接并提交任务：
+在第二个终端检查连接、提交任务并查询状态：
 
 ```bash
-./build/runnerctl ping                         # 输出 PONG
-./build/runnerctl submit -- /bin/echo hello   # 输出 JobId，例如 1
-```
+./build/runnerctl ping
+# PONG
 
-提交带有正数毫秒超时配置的任务：
+./build/runnerctl submit -- /bin/sleep 10
+# 1
 
-```bash
-./build/runnerctl submit --timeout 5000 -- /bin/sleep 1
-```
-
-查询单个任务或列出全部任务：
-
-```bash
 ./build/runnerctl status 1
 ./build/runnerctl list
 ```
 
-省略 `--socket` 时默认使用 `/tmp/runnerd.sock`。自定义路径时，服务端和
-客户端必须使用相同参数：
+默认 socket 路径为 `/tmp/runnerd.sock`。如需使用其他路径，服务端和客户端必须
+使用同一个参数：
 
 ```bash
 ./build/runnerd --socket /tmp/runnerd-demo.sock
 ./build/runnerctl --socket /tmp/runnerd-demo.sock ping
 ```
 
-`--` 表示 `runnerctl` 自身的选项到此结束，后面的内容全部属于任务 argv。
-`argv[0]` 必须是绝对路径，所以 `echo hello` 和 `./echo hello` 会被拒绝。
-stdout/stderr 会由 daemon 采集，但目前还不能通过客户端查询。
+`--` 表示 `runnerctl` 自身的选项到此结束，其后每一项都会成为任务的 `argv`。
+可执行文件（`argv[0]`）必须是绝对路径。
 
-![runnerd 运行效果](docs/images/runnerd-demo.png)
+### 使用说明
 
-### 运行测试
+- `runnerd` 不经过 shell 执行任务。因此 `|`、`>`、`$VAR` 等 shell 语法不会被解释，
+  而是作为普通参数传给目标程序。
+- 客户端断开连接不会取消已提交的任务；任务仍由 daemon 继续监管。
+- daemon 会采集 stdout/stderr，但当前 `runnerctl` 只能查询状态和元数据，不能读取输出正文。
 
-```bash
-cmake -E chdir build ctest --output-on-failure
+![两个终端展示 daemon 接收任务，runnerctl 查询其状态](docs/images/runnerd-demo.png)
+
+## 🏗️ 架构
+
+```mermaid
+flowchart TB
+    CLI["runnerctl"]
+    Socket[("Unix Domain Socket<br/>/tmp/runnerd.sock")]
+    CLI <-->|"长度前缀请求 / 响应帧"| Socket
+
+    subgraph Daemon["runnerd daemon"]
+        Loop["epoll 事件循环"]
+        Decode["帧解码<br/>与请求校验"]
+        Route{"请求类型"}
+        Reply["每个客户端的响应缓冲区"]
+        Jobs[("内存任务表<br/>状态 · 元数据 · 已采集输出")]
+        Monitor["ProcessMonitor"]
+        Launcher["process_launcher<br/>fork / execve · 进程组"]
+        Signal["signalfd<br/>SIGCHLD"]
+        Pipes[/"非阻塞管道<br/>stdout · stderr · 启动错误"/]
+
+        Loop -->|"客户端 socket 事件"| Decode --> Route
+        Route -->|"PING"| Reply
+        Route -->|"SUBMIT"| Jobs
+        Route -->|"STATUS / LIST"| Jobs
+        Jobs -->|"查询结果"| Reply
+        Reply -->|"写入响应"| Loop
+
+        Jobs -->|"启动与监管"| Monitor --> Launcher
+        Pipes -->|"输出 / 启动错误事件"| Loop
+        Signal -->|"子进程退出事件"| Loop
+        Loop -->|"分派 fd / 信号事件"| Monitor
+        Monitor -->|"更新状态与输出"| Jobs
+    end
+
+    Socket <-->|"读取 / 写入"| Loop
+    Launcher --> Child["子进程组<br/>任务可执行文件"]
+    Child -->|"stdout / stderr / exec 失败"| Pipes
+    Child -->|"退出"| Signal
 ```
 
-当前测试目标包括：
+客户端 socket、子进程输出管道和 `SIGCHLD` 都由同一个 `epoll` 循环监听。
+`SUBMIT` 创建任务并交给 `ProcessMonitor` 启动与监管；`STATUS` 和 `LIST` 只读取
+内存任务表。客户端断开连接不会终止已提交的任务；只有子进程退出且所有受监控管道
+均到达 EOF 后，任务才会结算。
 
-| 测试目标 | 主要覆盖 |
+## 🧩 项目结构
+
+| 路径或模块 | 职责 |
 | --- | --- |
-| `protocol_test` | 帧、SUBMIT 和 STATUS 编解码及畸形输入 |
-| `job_test` | 参数校验、状态迁移和终态判断 |
-| `process_launcher_test` | fork/execve、pipe、进程组和启动错误 |
-| `process_monitor_test` | 输出采集、退出结算、大输出和并发回收 |
-| `runnerd_integration_test` | 真实 daemon、并发 PING、SUBMIT、STATUS 和 LIST |
+| `include/runnerd/` | 协议、任务、进程和 Unix Socket 模块的公共声明。 |
+| `src/protocol.cpp` | 长度前缀帧、请求编码与增量解码。 |
+| `src/job.cpp` | `JobSpec` 校验、任务模型和状态转移规则。 |
+| `src/process_launcher.cpp` | pipe、`fork/execve`、标准流重定向和进程组创建。 |
+| `src/process_monitor.cpp` | `epoll` 注册、输出采集、`SIGCHLD` 处理与任务结算。 |
+| `src/runnerd_main.cpp` | daemon 入口和事件循环。 |
+| `src/runnerctl_main.cpp` | 命令行客户端和用户可见的输出。 |
+| `tests/` | 单元测试与真实 daemon 的端到端集成测试。 |
 
-## 📡 当前协议
+## 🔌 命令与协议
 
-Unix Domain Stream Socket 与 TCP 一样不保留消息边界，因此当前协议使用
-4 字节大端长度前缀界定 payload，单帧最大为 64 KiB：
+| 命令 | 说明 |
+| --- | --- |
+| `runnerctl ping` | 检查 daemon 是否可达。 |
+| `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | 启动任务并返回 JobId。 |
+| `runnerctl status <job_id>` | 返回单个任务的当前状态或终态。 |
+| `runnerctl list` | 按 JobId 顺序列出全部内存任务。 |
+
+底层使用 Unix Domain Stream Socket。每条消息由 4 字节大端 payload 长度和最大
+64 KiB 的 payload 组成：
 
 ```text
 [ payload length: uint32 big-endian ][ payload bytes ]
 ```
+
+当前支持 `PING`、`SUBMIT`、`STATUS` 和 `LIST`。非法请求会返回
+`ERR <message>`。`FrameDecoder` 能跨多次读取组装单帧，也能从一次读取中解码
+多帧。
+
+### 任务生命周期
+
+合法任务会先获得 JobId 并进入 `QUEUED`，启动成功后进入 `RUNNING`。子进程以
+退出码 `0` 退出时任务变为 `SUCCEEDED`；启动失败、非零退出码或被信号终止时则为
+`FAILED`。启动前发生资源创建或注册失败时，任务也可以直接从 `QUEUED` 进入
+`FAILED`。
+
+```text
+QUEUED ──> RUNNING ──> SUCCEEDED
+   │          └──────> FAILED
+   └─────────────────> FAILED
+```
+
+`status` 会返回 JobId 和状态；在字段可用时，还会包含 PID、超时配置、退出码、
+退出信号或启动失败信息。终态任务还会记录已采集 stdout/stderr 的字节数。
+
+### 线协议摘要
 
 | 请求 | 成功响应 |
 | --- | --- |
 | `PING` | `PONG` |
 | `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
 | `STATUS + job_id` | `OK id=<id> state=<state> ...` |
-| `LIST` | `OK` 后跟按 JobId 排序的任务摘要 |
+| `LIST` | `OK`，后跟按 JobId 排序的任务摘要 |
 
-SUBMIT 中的整数和参数长度同样使用大端无符号整数；`timeout_ms = 0`
-表示不设置超时。STATUS 的 JobId 使用 8 字节大端无符号整数。非法请求返回
-`ERR <message>`。`FrameDecoder` 支持跨多次读取组装一帧，也能从一次读取中
-解析多帧。
+`SUBMIT` 中的整数和参数长度均使用大端无符号整数；`timeout_ms = 0` 表示未配置
+超时。Unix Domain **Stream** Socket 不保留消息边界，因此客户端和服务端均通过
+`FrameDecoder` 处理拆包与粘包。
 
-## 🎯 设计边界
+## 🧭 项目状态与边界
 
-项目最终定位为同一用户本机上的任务执行服务，明确不计划支持：
+项目有意聚焦于本地单用户 daemon。下列限制是当前真实行为，而非隐藏的取舍：
 
-- TCP 远程访问
-- 多用户登录和权限系统
-- HTTP 或 Web UI
-- 容器和 cgroup
-- 数据库和分布式 Agent
-- 线程池、任务依赖 DAG 和自动重试
+| 领域 | 当前行为 |
+| --- | --- |
+| 超时 | `--timeout` 会被校验并保存到 `JobSpec`，但目前不会终止超时任务。 |
+| 调度 | 合法任务立即启动；没有等待队列和并发上限。 |
+| 任务数据 | 任务元数据和已采集输出仅保存在内存中，daemon 重启后丢失。 |
+| 输出 | stdout/stderr 会被采集，但暂不能通过 `runnerctl` 查询，且未设大小上限。 |
+| 控制 | 尚无取消任务命令。 |
+| 安全模型 | socket 为本地 `0600` 文件，但没有认证、容器隔离、cgroup 或多用户授权。 |
 
-这些边界让项目可以集中展示 Linux 进程管理、非阻塞 I/O、事件循环和
-崩溃恢复等核心能力。
+明确不在范围内的能力包括：TCP 远程访问、HTTP 或 Web UI、数据库、分布式 Agent、
+线程池、任务依赖 DAG、自动重试和多用户登录。
 
-## 🗺️ 路线图
+## 🛠️ 开发
 
-- [x] 初始化 CMake、GoogleTest、CTest、需求文档和状态机文档
-- [x] 完成 Unix Domain Socket 与 `PING/PONG` 通信
-- [x] 实现长度前缀协议和增量解码
-- [x] 使用非阻塞 I/O、连接状态、写缓冲和 `epoll` 支持多个客户端
-- [x] 定义任务数据模型、参数校验、状态迁移规则和对应单元测试
-- [x] 实现 SUBMIT 编解码、JobId 分配和内存任务表
-- [x] 使用 `fork/execve` 启动任务并采集 stdout/stderr
-- [x] 实现 STATUS 和 LIST 任务查询
-- [ ] 实现并发队列、取消和超时
-- [ ] 使用 journal 保存任务历史并支持重启恢复
-- [ ] 补充更多异常场景集成测试、Sanitizer 检查和诊断报告
-
-## 📚 文档
-
-- [需求说明](docs/requirements.md)
-- [任务状态机](docs/state_machine.md)
-- [进程启动器](docs/process_launcher.md)
-
-## 🤝 Contributing
-
-欢迎提交 Issue 和 Pull Request。
-
-提交代码前，请确保项目能够完成构建和测试：
+### 运行测试
 
 ```bash
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
 cmake -E chdir build ctest --output-on-failure
 ```
 
-项目仍处于早期阶段。如果改动涉及协议、状态机或任务生命周期，建议先在
-Issue 中说明设计和行为边界。
+测试套件使用 GoogleTest 1.17.0。首次 CMake 配置时，`FetchContent` 会下载并校验
+该依赖；后续配置会复用构建目录中的副本。
 
-## 📄 License
+### CMake 配置
 
-本项目使用 [MIT License](LICENSE)。
+`BUILD_TESTING` 默认开启。如只需要构建 `runnerd` 和 `runnerctl`，且不希望下载
+GoogleTest，可关闭测试目标：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build --parallel
+```
+
+项目固定使用 C++17，并禁用编译器扩展；各目标均开启 `-Wall`、`-Wextra` 和
+`-Wpedantic`。CMake 会生成 `compile_commands.json`，便于 clangd 等工具读取真实的
+编译参数。
+
+| 测试目标 | 主要覆盖内容 |
+| --- | --- |
+| `smoke_test` | GoogleTest/CTest 最小可用性检查 |
+| `protocol_test` | 分帧、SUBMIT/STATUS 编解码与畸形输入 |
+| `job_test` | 参数校验、状态转移和终态 |
+| `process_launcher_test` | `fork/execve`、管道、进程组和启动失败 |
+| `process_monitor_test` | 输出采集、结算、大输出和并发回收 |
+| `runnerd_integration_test` | 真实 daemon、20 个并发 PING 客户端及 SUBMIT/STATUS/LIST 流程 |
+
+## 📚 文档
+
+| 文档 | 说明 |
+| --- | --- |
+| [需求说明](docs/requirements.md) | 功能目标、请求约束、当前查询行为和明确的非目标。 |
+| [任务状态机](docs/state_machine.md) | 全部状态、合法迁移、终态规则及当前运行时行为。 |
+| [进程启动器](docs/process_launcher.md) | 文件描述符所有权、子进程启动顺序和错误上报机制。 |
+
+## 🗺️ 路线图
+
+- [x] Unix Domain Socket 通信、长度前缀分帧和增量解码
+- [x] 基于 `epoll` 的多客户端非阻塞 I/O
+- [x] 任务模型、状态机和内存任务表
+- [x] `fork/execve` 启动、进程组、输出采集和回收
+- [x] `STATUS` 与 `LIST` 查询
+- [ ] 强制超时、取消任务、有界输出和输出查询
+- [ ] 并发上限和等待队列
+- [ ] 任务历史持久化与重启恢复
+- [ ] 更多失败路径的集成测试、Sanitizer 检查和诊断报告
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request。提交 Pull Request 前，请确保项目可以构建并通过完整
+测试。对于会改变协议、任务状态机或生命周期语义的改动，请先创建 Issue，说明预期
+行为和边界。
+
+## 📄 许可证
+
+本项目采用 [MIT License](LICENSE) 开源。
