@@ -65,7 +65,7 @@ reached EOF.
 
 | Module | Responsibility |
 | --- | --- |
-| `protocol` | Framing and PING/SUBMIT/STATUS encoding |
+| `protocol` | Length-prefixed framing and SUBMIT/STATUS encoding |
 | `job` | Job model, validation, and state machine |
 | `process_launcher` | Pipes, fork, redirection, process groups, and execve |
 | `process_monitor` | epoll registration, output capture, SIGCHLD, and settlement |
@@ -148,6 +148,8 @@ The `--` delimiter ends `runnerctl` option parsing; everything after it is
 preserved as job argv. `argv[0]` must be an absolute path, so `echo hello` and
 `./echo hello` are rejected. The daemon captures stdout/stderr, but the client
 cannot query it yet.
+
+![runnerd runtime demo](docs/images/runnerd-demo.png)
 
 ### Run the Tests
 

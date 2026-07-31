@@ -86,7 +86,10 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取�
 - 客户端断开后任务仍然执行并保留。
 - 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
   退出、信号终止或启动失败时进入 `FAILED`。
-- stdout/stderr 暂存在任务对象中，尚不能通过客户端查询。
+- `runnerctl status <job_id>` 可以查询任务当前状态和已经产生的运行结果；
+  `runnerctl list` 按 JobId 升序列出内存任务。
+- stdout/stderr 在任务最终结算后保存在任务对象中，尚不能通过客户端查询
+  正文。
 - 因为尚未实现 journal，daemon 重启后内存任务会丢失。
 
 ## 测试覆盖
@@ -101,3 +104,7 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取�
 
 `tests/process_monitor_test.cpp` 还覆盖成功执行、stdout/stderr 采集、
 execve 失败、非零退出、大输出排空和多个子进程同时回收。
+
+`tests/runnerd_integration_test.cpp` 通过真实 daemon 和 runnerctl 覆盖成功
+任务与失败任务的 STATUS 查询、非零退出码、stdout/stderr 字节数、LIST
+顺序、不存在的 JobId，以及非法 STATUS/LIST 参数。

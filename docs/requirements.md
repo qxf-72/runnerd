@@ -38,7 +38,7 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 
 - [x] `JobSpec`、`Job` 和 `JobState` 数据模型
 - [x] 任务参数校验和状态迁移规则
-- [x] JobId 分配和内存中的 `QUEUED` 任务表
+- [x] JobId 分配和内存任务表
 - [x] 使用 `fork + execve` 启动任务
 - [x] 采集 stdout 和 stderr
 - [x] 使用 `signalfd` 接收 `SIGCHLD` 并通过 `waitpid` 回收子进程
@@ -86,6 +86,19 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - timeout 当前只被保存，不会触发计时或终止。
 - 当前没有调度队列和并发限制，每个合法任务都会立即尝试启动。
 - 所有任务、输出和结果仍只存在于 daemon 内存中。
+
+## 当前查询行为
+
+- `runnerctl status <job_id>` 查询单个任务。响应始终包含 JobId 和当前状态；
+  如果对应字段已经产生，还会包含 `timeout_ms`、PID、退出码、退出信号和
+  失败信息。
+- `ProcessMonitor` 在任务最终结算时才把输出移动到 `Job`，因此只有终态任务的
+  STATUS 响应会显示完整的 stdout/stderr 字节数。
+- `runnerctl list` 按 JobId 升序输出内存中的任务，只显示 JobId 和状态；
+  没有任务时客户端输出 `No jobs`。
+- LIST 当前没有分页。完整响应如果超过 64 KiB 单帧上限，服务端会返回
+  `ERR too many jobs to list`，不会返回残缺列表。
+- `STATUS` 和 `LIST` 只能查询当前 daemon 内存中的任务；重启后不能查询旧任务。
 
 ## 任务结果
 

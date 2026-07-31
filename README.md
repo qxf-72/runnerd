@@ -60,7 +60,7 @@ runnerd（epoll 事件循环）
 
 | 模块 | 职责 |
 | --- | --- |
-| `protocol` | 帧协议及 PING/SUBMIT/STATUS 编解码 |
+| `protocol` | 长度前缀帧及 SUBMIT/STATUS 编解码 |
 | `job` | 任务模型、参数校验和状态机 |
 | `process_launcher` | pipe、fork、重定向、进程组和 execve |
 | `process_monitor` | epoll 注册、输出采集、SIGCHLD 和任务结算 |
@@ -141,6 +141,8 @@ runnerctl [--socket <path>] list
 `--` 表示 `runnerctl` 自身的选项到此结束，后面的内容全部属于任务 argv。
 `argv[0]` 必须是绝对路径，所以 `echo hello` 和 `./echo hello` 会被拒绝。
 stdout/stderr 会由 daemon 采集，但目前还不能通过客户端查询。
+
+![runnerd 运行效果](docs/images/runnerd-demo.png)
 
 ### 运行测试
 
