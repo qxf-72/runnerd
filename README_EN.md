@@ -9,6 +9,7 @@ English | [简体中文](README.md)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B&logoColor=white)
 ![CMake](https://img.shields.io/badge/CMake-3.16%2B-064F8C?logo=cmake)
 ![Platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
+[![CI](https://github.com/qxf-72/runnerd/actions/workflows/ci.yml/badge.svg)](https://github.com/qxf-72/runnerd/actions/workflows/ci.yml)
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 [![License](https://img.shields.io/github/license/qxf-72/runnerd)](LICENSE)
 
@@ -241,6 +242,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 cmake -E chdir build ctest --output-on-failure
 ```
+
+GitHub Actions runs the same configure, build, and test sequence on Ubuntu for
+every push and pull request.
 
 The test suite uses GoogleTest 1.17.0. On its first configuration, CMake
 `FetchContent` downloads and verifies the dependency; later configurations
