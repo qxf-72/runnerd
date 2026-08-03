@@ -98,9 +98,9 @@ target_include_directories(runnerd_monitor PUBLIC
 
 target_link_libraries(runnerd_monitor
     PUBLIC
-        runnerd_job
+    runnerd_job
     PRIVATE
-        runnerd_process
+    runnerd_process
 )
 
 target_compile_options(runnerd_monitor PRIVATE
@@ -159,6 +159,27 @@ target_compile_options(runnerctl PRIVATE
     -Wextra
     -Wpedantic
 )
+
+# FIFO 等待队列与最大并发槽位。
+# 只负责调度策略，不直接启动或监控子进程。
+add_library(runnerd_scheduler STATIC
+    src/job_scheduler.cpp
+)
+
+target_include_directories(runnerd_scheduler PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(runnerd_scheduler PUBLIC
+    runnerd_job
+)
+
+target_compile_options(runnerd_scheduler PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
 
 # GoogleTest 测试目标。
 include(CTest)
@@ -301,4 +322,21 @@ if(BUILD_TESTING)
         process_monitor_test
         PROPERTIES TIMEOUT 10
     )
+
+    add_executable(job_scheduler_test
+        tests/job_scheduler_test.cpp
+    )
+
+    target_link_libraries(job_scheduler_test PRIVATE
+        runnerd_scheduler
+        GTest::gtest_main
+    )
+
+    target_compile_options(job_scheduler_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+
+    gtest_discover_tests(job_scheduler_test)
 endif()
