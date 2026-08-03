@@ -39,6 +39,7 @@ purpose scheduler or remote execution platform.
 | Event-driven I/O | One level-triggered `epoll` loop serves clients and child-process pipes without blocking. |
 | Reliable framing | A length-prefixed protocol with incremental decoding handles partial, coalesced, and binary payloads. |
 | Process supervision | Jobs use `fork/execve` and a separate process group; no shell is involved. |
+| Bounded concurrency | `--max-running` configures execution slots; excess jobs enter a FIFO waiting queue. |
 | Observable lifecycle | `signalfd + waitpid` and non-blocking stdout/stderr pipes drive a documented job state machine. |
 | Tested behavior | GoogleTest and CTest cover protocol, state transitions, process launch, monitoring, and end-to-end flows. |
 
@@ -68,8 +69,10 @@ requires access to GitHub.
 Start the daemon in one terminal:
 
 ```bash
-./build/runnerd
+./build/runnerd --max-running 2
 ```
+
+`--max-running` must be a positive integer and defaults to `1`.
 
 Use a second terminal to check the connection, submit a job, and inspect it:
 
@@ -88,7 +91,7 @@ The default socket path is `/tmp/runnerd.sock`. To use a different path, pass
 the same option to both programs:
 
 ```bash
-./build/runnerd --socket /tmp/runnerd-demo.sock
+./build/runnerd --socket /tmp/runnerd-demo.sock --max-running 2
 ./build/runnerctl --socket /tmp/runnerd-demo.sock ping
 ```
 
@@ -103,8 +106,9 @@ the job's `argv`. The executable (`argv[0]`) must be an absolute path.
   to supervise it.
 - The daemon captures stdout/stderr, but `runnerctl` currently exposes status and
   metadata only, not the output content.
-
-![Two terminals demonstrate the daemon accepting jobs while runnerctl queries their state](docs/images/runnerd-demo.png)
+- Execution slots are currently assigned only when SUBMIT is handled. Releasing
+  a slot and automatically starting the FIFO head after a job finishes is the
+  next integration step.
 
 ## 🏗️ Architecture
 
@@ -120,6 +124,7 @@ flowchart TB
         Route{"Request type"}
         Reply["Per-client response buffer"]
         Jobs[("In-memory job table<br/>state · metadata · captured output")]
+        Scheduler["JobScheduler<br/>FIFO queue · execution slots"]
         Monitor["ProcessMonitor"]
         Launcher["process_launcher<br/>fork / execve · process group"]
         Signal["signalfd<br/>SIGCHLD"]
@@ -132,7 +137,8 @@ flowchart TB
         Jobs -->|"query result"| Reply
         Reply -->|"write response"| Loop
 
-        Jobs -->|"start and supervise"| Monitor --> Launcher
+        Jobs -->|"enqueue"| Scheduler
+        Scheduler -->|"grant start slot"| Monitor --> Launcher
         Pipes -->|"output / startup-error event"| Loop
         Signal -->|"child-exit event"| Loop
         Loop -->|"dispatch fd / signal event"| Monitor
@@ -146,10 +152,11 @@ flowchart TB
 ```
 
 Client sockets, child-process output pipes, and `SIGCHLD` are all observed by
-one `epoll` loop. `SUBMIT` creates a job and hands it to `ProcessMonitor` for
-launch and supervision; `STATUS` and `LIST` read only from the in-memory job
-table. A client disconnect does not terminate a submitted job. A job is
-settled only after its child has exited and every monitored pipe reaches EOF.
+one `epoll` loop. `SUBMIT` creates a job and enqueues it in `JobScheduler`; when
+a slot is available, the scheduler hands the FIFO head to `ProcessMonitor` for
+launch and supervision. `STATUS` and `LIST` read only from the in-memory job
+table. A client disconnect does not terminate a submitted job. A job is settled
+only after its child has exited and every monitored pipe reaches EOF.
 
 ## 🧩 Project Structure
 
@@ -158,6 +165,7 @@ settled only after its child has exited and every monitored pipe reaches EOF.
 | `include/runnerd/` | Public declarations for the protocol, job, process, and Unix Socket modules. |
 | `src/protocol.cpp` | Length-prefixed frames, request encoding, and incremental decoding. |
 | `src/job.cpp` | `JobSpec` validation, the job model, and state-transition rules. |
+| `src/job_scheduler.cpp` | FIFO waiting order, maximum execution slots, and queued-job removal. |
 | `src/process_launcher.cpp` | Pipes, `fork/execve`, standard-stream redirection, and process-group setup. |
 | `src/process_monitor.cpp` | `epoll` registration, output collection, `SIGCHLD` handling, and job settlement. |
 | `src/runnerd_main.cpp` | Daemon entry point and event loop. |
@@ -168,8 +176,9 @@ settled only after its child has exited and every monitored pipe reaches EOF.
 
 | Command | Description |
 | --- | --- |
+| `runnerd [--socket <path>] [--max-running <N>]` | Starts the daemon; `N` defaults to `1`. |
 | `runnerctl ping` | Checks that the daemon is reachable. |
-| `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | Starts a job and returns its JobId. |
+| `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | Submits a job and returns its JobId. |
 | `runnerctl status <job_id>` | Returns one job's current or terminal state. |
 | `runnerctl list` | Lists all in-memory jobs in JobId order. |
 
@@ -224,7 +233,7 @@ limitations are current behavior, not hidden trade-offs:
 | Area | Current behavior |
 | --- | --- |
 | Timeouts | `--timeout` is validated and stored in `JobSpec`, but does not terminate jobs yet. |
-| Scheduling | Valid jobs start immediately; there is no queue or concurrency limit. |
+| Scheduling | `--max-running` limits initial concurrency and excess jobs remain `QUEUED` in FIFO order; slot release and automatic queue advancement after completion are not wired in yet. |
 | Job data | Job metadata and captured output exist only in memory and are lost after restart. |
 | Output | stdout/stderr are captured, but cannot yet be queried through `runnerctl`; no size limit is applied. |
 | Control | There is no cancellation command. |
@@ -269,9 +278,10 @@ The project requires C++17 and disables compiler extensions. Every target uses
 | `smoke_test` | Minimal GoogleTest/CTest availability check |
 | `protocol_test` | Framing, SUBMIT/STATUS encoding, and malformed input |
 | `job_test` | Validation, state transitions, and terminal states |
+| `job_scheduler_test` | FIFO order, execution slots, slot release, and queued-job removal |
 | `process_launcher_test` | `fork/execve`, pipes, process groups, and startup failures |
 | `process_monitor_test` | Output capture, settlement, large output, and concurrent reaping |
-| `runnerd_integration_test` | A real daemon, 20 concurrent PING clients, and SUBMIT/STATUS/LIST flows |
+| `runnerd_integration_test` | A real daemon, concurrent PING, job queries, and initial max-concurrency queuing |
 
 ## 📚 Documentation
 
@@ -288,8 +298,9 @@ The project requires C++17 and disables compiler extensions. Every target uses
 - [x] Job model, state machine, and in-memory job table
 - [x] `fork/execve` launch, process groups, output capture, and reaping
 - [x] `STATUS` and `LIST` queries
+- [x] FIFO waiting queue, `--max-running`, and initial execution-slot control
+- [ ] Release slots and automatically start the FIFO head after job completion
 - [ ] Enforced timeouts, cancellation, bounded output, and output retrieval
-- [ ] Concurrency limits and a waiting queue
 - [ ] Persistent job history and restart recovery
 - [ ] More failure-path integration tests, Sanitizer checks, and diagnostics
 

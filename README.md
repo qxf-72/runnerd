@@ -37,6 +37,7 @@
 | 事件驱动 I/O | 一个 LT `epoll` 事件循环同时服务客户端与子进程管道，不阻塞主循环。 |
 | 可靠分帧 | 长度前缀协议和增量解码正确处理拆包、粘包及二进制 payload。 |
 | 进程监管 | 通过 `fork/execve` 和独立进程组启动任务，全程不经过 shell。 |
+| 有界并发 | `--max-running` 设置运行槽位，超额任务进入 FIFO 等待队列。 |
 | 可观测生命周期 | `signalfd + waitpid` 配合非阻塞 stdout/stderr 管道，驱动有文档说明的任务状态机。 |
 | 可验证行为 | GoogleTest 与 CTest 覆盖协议、状态转移、进程启动、监控和端到端流程。 |
 
@@ -65,8 +66,10 @@ cmake --build build --parallel
 在第一个终端启动 daemon：
 
 ```bash
-./build/runnerd
+./build/runnerd --max-running 2
 ```
+
+`--max-running` 必须是正整数，默认值为 `1`。
 
 在第二个终端检查连接、提交任务并查询状态：
 
@@ -85,7 +88,7 @@ cmake --build build --parallel
 使用同一个参数：
 
 ```bash
-./build/runnerd --socket /tmp/runnerd-demo.sock
+./build/runnerd --socket /tmp/runnerd-demo.sock --max-running 2
 ./build/runnerctl --socket /tmp/runnerd-demo.sock ping
 ```
 
@@ -98,8 +101,8 @@ cmake --build build --parallel
   而是作为普通参数传给目标程序。
 - 客户端断开连接不会取消已提交的任务；任务仍由 daemon 继续监管。
 - daemon 会采集 stdout/stderr，但当前 `runnerctl` 只能查询状态和元数据，不能读取输出正文。
-
-![两个终端展示 daemon 接收任务，runnerctl 查询其状态](docs/images/runnerd-demo.png)
+- 当前只在收到 SUBMIT 时分配运行槽位；运行任务结束后释放槽位并自动启动队首任务
+  将在下一阶段接入。
 
 ## 🏗️ 架构
 
@@ -115,6 +118,7 @@ flowchart TB
         Route{"请求类型"}
         Reply["每个客户端的响应缓冲区"]
         Jobs[("内存任务表<br/>状态 · 元数据 · 已采集输出")]
+        Scheduler["JobScheduler<br/>FIFO 队列 · 运行槽位"]
         Monitor["ProcessMonitor"]
         Launcher["process_launcher<br/>fork / execve · 进程组"]
         Signal["signalfd<br/>SIGCHLD"]
@@ -127,7 +131,8 @@ flowchart TB
         Jobs -->|"查询结果"| Reply
         Reply -->|"写入响应"| Loop
 
-        Jobs -->|"启动与监管"| Monitor --> Launcher
+        Jobs -->|"加入等待队列"| Scheduler
+        Scheduler -->|"取得启动资格"| Monitor --> Launcher
         Pipes -->|"输出 / 启动错误事件"| Loop
         Signal -->|"子进程退出事件"| Loop
         Loop -->|"分派 fd / 信号事件"| Monitor
@@ -141,9 +146,9 @@ flowchart TB
 ```
 
 客户端 socket、子进程输出管道和 `SIGCHLD` 都由同一个 `epoll` 循环监听。
-`SUBMIT` 创建任务并交给 `ProcessMonitor` 启动与监管；`STATUS` 和 `LIST` 只读取
-内存任务表。客户端断开连接不会终止已提交的任务；只有子进程退出且所有受监控管道
-均到达 EOF 后，任务才会结算。
+`SUBMIT` 创建任务并加入 `JobScheduler`；调度器在有空闲槽位时把 FIFO 队首交给
+`ProcessMonitor` 启动与监管。`STATUS` 和 `LIST` 只读取内存任务表。客户端断开连接
+不会终止已提交的任务；只有子进程退出且所有受监控管道均到达 EOF 后，任务才会结算。
 
 ## 🧩 项目结构
 
@@ -152,6 +157,7 @@ flowchart TB
 | `include/runnerd/` | 协议、任务、进程和 Unix Socket 模块的公共声明。 |
 | `src/protocol.cpp` | 长度前缀帧、请求编码与增量解码。 |
 | `src/job.cpp` | `JobSpec` 校验、任务模型和状态转移规则。 |
+| `src/job_scheduler.cpp` | FIFO 等待顺序、最大并发槽位和排队任务移除。 |
 | `src/process_launcher.cpp` | pipe、`fork/execve`、标准流重定向和进程组创建。 |
 | `src/process_monitor.cpp` | `epoll` 注册、输出采集、`SIGCHLD` 处理与任务结算。 |
 | `src/runnerd_main.cpp` | daemon 入口和事件循环。 |
@@ -162,8 +168,9 @@ flowchart TB
 
 | 命令 | 说明 |
 | --- | --- |
+| `runnerd [--socket <path>] [--max-running <N>]` | 启动 daemon；`N` 默认为 `1`。 |
 | `runnerctl ping` | 检查 daemon 是否可达。 |
-| `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | 启动任务并返回 JobId。 |
+| `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | 提交任务并返回 JobId。 |
 | `runnerctl status <job_id>` | 返回单个任务的当前状态或终态。 |
 | `runnerctl list` | 按 JobId 顺序列出全部内存任务。 |
 
@@ -214,7 +221,7 @@ QUEUED ──> RUNNING ──> SUCCEEDED
 | 领域 | 当前行为 |
 | --- | --- |
 | 超时 | `--timeout` 会被校验并保存到 `JobSpec`，但目前不会终止超时任务。 |
-| 调度 | 合法任务立即启动；没有等待队列和并发上限。 |
+| 调度 | `--max-running` 限制初始并发数，超额任务按 FIFO 保持 `QUEUED`；任务结束后的槽位释放和队列自动推进尚未接入。 |
 | 任务数据 | 任务元数据和已采集输出仅保存在内存中，daemon 重启后丢失。 |
 | 输出 | stdout/stderr 会被采集，但暂不能通过 `runnerctl` 查询，且未设大小上限。 |
 | 控制 | 尚无取消任务命令。 |
@@ -258,9 +265,10 @@ cmake --build build --parallel
 | `smoke_test` | GoogleTest/CTest 最小可用性检查 |
 | `protocol_test` | 分帧、SUBMIT/STATUS 编解码与畸形输入 |
 | `job_test` | 参数校验、状态转移和终态 |
+| `job_scheduler_test` | FIFO 顺序、并发槽位、槽位释放和排队任务移除 |
 | `process_launcher_test` | `fork/execve`、管道、进程组和启动失败 |
 | `process_monitor_test` | 输出采集、结算、大输出和并发回收 |
-| `runnerd_integration_test` | 真实 daemon、20 个并发 PING 客户端及 SUBMIT/STATUS/LIST 流程 |
+| `runnerd_integration_test` | 真实 daemon、并发 PING、任务查询及最大并发初始排队 |
 
 ## 📚 文档
 
@@ -277,8 +285,9 @@ cmake --build build --parallel
 - [x] 任务模型、状态机和内存任务表
 - [x] `fork/execve` 启动、进程组、输出采集和回收
 - [x] `STATUS` 与 `LIST` 查询
+- [x] FIFO 等待队列、`--max-running` 与初始运行槽位控制
+- [ ] 任务结束后释放槽位并自动启动 FIFO 队首
 - [ ] 强制超时、取消任务、有界输出和输出查询
-- [ ] 并发上限和等待队列
 - [ ] 任务历史持久化与重启恢复
 - [ ] 更多失败路径的集成测试、Sanitizer 检查和诊断报告
 

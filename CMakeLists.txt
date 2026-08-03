@@ -113,6 +113,26 @@ target_compile_definitions(runnerd_monitor PRIVATE
     _GNU_SOURCE
 )
 
+# FIFO 等待队列与最大并发槽位。
+# 只负责调度策略，不直接启动或监控子进程。
+add_library(runnerd_scheduler STATIC
+    src/job_scheduler.cpp
+)
+
+target_include_directories(runnerd_scheduler PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(runnerd_scheduler PUBLIC
+    runnerd_job
+)
+
+target_compile_options(runnerd_scheduler PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
 # 常驻任务执行服务。
 add_executable(runnerd
     src/runnerd_main.cpp
@@ -127,6 +147,7 @@ target_link_libraries(runnerd PRIVATE
     runnerd_fd_utils
     runnerd_monitor
     runnerd_protocol
+    runnerd_scheduler
 )
 
 target_compile_options(runnerd PRIVATE
@@ -160,25 +181,6 @@ target_compile_options(runnerctl PRIVATE
     -Wpedantic
 )
 
-# FIFO 等待队列与最大并发槽位。
-# 只负责调度策略，不直接启动或监控子进程。
-add_library(runnerd_scheduler STATIC
-    src/job_scheduler.cpp
-)
-
-target_include_directories(runnerd_scheduler PUBLIC
-    ${PROJECT_SOURCE_DIR}/include
-)
-
-target_link_libraries(runnerd_scheduler PUBLIC
-    runnerd_job
-)
-
-target_compile_options(runnerd_scheduler PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-)
 
 
 # GoogleTest 测试目标。

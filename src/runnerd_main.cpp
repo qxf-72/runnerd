@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -17,6 +18,7 @@
 
 #include "runnerd/fd_utils.h"
 #include "runnerd/job.h"
+#include "runnerd/job_scheduler.h"
 #include "runnerd/process_monitor.h"
 #include "runnerd/protocol.h"
 #include "runnerd/unix_socket.h"
@@ -25,19 +27,108 @@ namespace {
 
 constexpr const char* kDefaultSocketPath = "/tmp/runnerd.sock";
 
-bool parseCommandLine(int argc, char* argv[], std::string& socket_path) {
-  socket_path = kDefaultSocketPath;
+// daemon 自己的启动参数。
+// 以后若加入 --data-dir，也继续放在这里，而不是散落在 main() 中。
+struct DaemonOptions {
+  std::string socket_path = kDefaultSocketPath;
 
-  if (argc == 1) {
-    return true;
+  // 默认一次只允许一个任务占用运行槽位。
+  std::size_t max_running = 1;
+};
+
+void printUsage(const char* program_name) {
+  std::cerr << "Usage: " << program_name
+            << " [--socket <path>] [--max-running <positive-integer>]\n";
+}
+
+// 解析正整数，并且在乘 10 前检查 size_t 溢出。
+bool parsePositiveMaxRunning(const std::string& text, std::size_t& result, std::string& error) {
+  if (text.empty()) {
+    error = "--max-running requires a positive integer";
+    return false;
   }
 
-  if (argc == 3 && std::string(argv[1]) == "--socket" && argv[2][0] != '\0') {
-    socket_path = argv[2];
-    return true;
+  std::size_t value = 0;
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+
+  for (const char character : text) {
+    if (character < '0' || character > '9') {
+      error = "--max-running must be a positive integer";
+      return false;
+    }
+
+    const std::size_t digit = static_cast<std::size_t>(character - '0');
+
+    // 在 value * 10 + digit 之前检查：
+    if (value > (maximum - digit) / 10U) {
+      error = "--max-running is too large";
+      return false;
+    }
+
+    value = value * 10U + digit;
   }
 
-  return false;
+  if (value == 0) {
+    error = "--max-running must be greater than zero";
+    return false;
+  }
+
+  result = value;
+  return true;
+}
+
+// 支持参数任意顺序。同一个选项出现两次时拒绝。
+bool parseCommandLine(int argc, char* argv[], DaemonOptions& options, std::string& error) {
+  options = DaemonOptions{};
+
+  bool socket_seen = false;
+  bool max_running_seen = false;
+
+  for (int index = 1; index < argc; ++index) {
+    const std::string argument = argv[index];
+
+    if (argument == "--socket") {
+      if (socket_seen) {
+        error = "--socket may only be specified once";
+        return false;
+      }
+
+      if (index + 1 >= argc || argv[index + 1][0] == '\0') {
+        error = "--socket requires a non-empty path";
+        return false;
+      }
+
+      options.socket_path = argv[index + 1];
+      socket_seen = true;
+      ++index;
+      continue;
+    }
+
+    if (argument == "--max-running") {
+      if (max_running_seen) {
+        error = "--max-running may only be specified once";
+        return false;
+      }
+
+      if (index + 1 >= argc) {
+        error = "--max-running requires a value";
+        return false;
+      }
+
+      if (!parsePositiveMaxRunning(argv[index + 1], options.max_running, error)) {
+        return false;
+      }
+
+      max_running_seen = true;
+      ++index;
+      continue;
+    }
+
+    error = "unknown argument: " + argument;
+    return false;
+  }
+
+  return true;
 }
 
 // 连接状态
@@ -57,6 +148,55 @@ using Connections = std::unordered_map<int, Connection>;
 
 // 任务属于 daemon，而不是某一条客户端连接。
 using Jobs = runnerd::JobTable;
+
+// 尽可能多地启动等待任务，直到：
+// 1. 等待队列为空；或
+// 2. 所有运行槽位都已被预留。
+//
+// 注意：这个函数只负责把 Scheduler 和 ProcessMonitor 串起来。
+// JobScheduler 不知道进程，ProcessMonitor 也不知道 FIFO 策略。
+void pumpScheduler(Jobs& jobs, runnerd::JobScheduler& scheduler,
+                   runnerd::ProcessMonitor& process_monitor) {
+  for (;;) {
+    // takeNextJobToStart() 成功时，Scheduler 已经为该任务预留了一个槽位。
+    const std::optional<runnerd::JobId> next_job_id = scheduler.takeNextJobToStart();
+
+    if (!next_job_id.has_value()) {
+      // 没有等待任务，或者没有空闲槽位。
+      return;
+    }
+
+    const runnerd::JobId job_id = *next_job_id;
+
+    // startJob() 的正常结果有两类：
+    //
+    // 1. 启动成功：
+    //    Job 从 QUEUED 变为 RUNNING，槽位继续被 Scheduler 保留。
+    //
+    // 2. 同步启动失败：
+    //    例如 fork 失败、监控 fd 注册失败。
+    //    ProcessMonitor 会把 Job 变为 FAILED。
+    process_monitor.startJob(job_id);
+
+    const runnerd::Job& job = jobs.at(job_id);
+
+    if (runnerd::isTerminal(job.state)) {
+      // 此任务在 startJob() 内同步失败，已经不会再收到后续的
+      // SIGCHLD / pipe / EOF 事件，因此必须立刻归还刚才预留的槽位。
+      scheduler.onJobReachedTerminalState(job_id);
+
+      // 归还槽位后，可能可以立刻启动队列中的下一个任务。
+      continue;
+    }
+
+    if (job.state != runnerd::JobState::kRunning) {
+      // 这是内部不变量检查：
+      // 调度器取出的 QUEUED Job，调用 startJob 后，要么 FAILED，
+      // 要么 RUNNING；出现第三种状态说明模块之间的约定被破坏。
+      throw std::logic_error("started job is neither RUNNING nor terminal");
+    }
+  }
+}
 
 bool hasPendingWrite(const Connection& connection) {
   return connection.write_offset < connection.write_buffer.size();
@@ -233,6 +373,7 @@ std::string makeListResponse(const Jobs& jobs) {
 }
 
 std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id,
+                          runnerd::JobScheduler& scheduler,
                           runnerd::ProcessMonitor& process_monitor) {
   if (request == "PING") {
     std::cout << "received PING\n";
@@ -295,10 +436,19 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
       throw std::logic_error("duplicate job id");
     }
 
-    // 只有保存成功后才消耗这个 ID。
+    try {
+      scheduler.enqueue(job_id);
+    } catch (...) {
+      jobs.erase(job_id);
+      throw;
+    }
+
+    // Job 同时成功进入 JobTable 和 Scheduler 后，
+    // 才真正消耗这个 JobId。
     ++next_job_id;
 
-    process_monitor.startJob(job_id);
+    // 根据当前空闲槽位，尽可能启动 FIFO 队列中的任务。
+    pumpScheduler(jobs, scheduler, process_monitor);
 
     std::cout << "accepted job " << job_id << '\n';
 
@@ -316,7 +466,8 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
 // true：本轮读取正常结束，继续保留连接。
 // false：发生无法恢复的读取错误，需要清理连接。
 bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
-                      runnerd::JobId& next_job_id, runnerd::ProcessMonitor& process_monitor) {
+                      runnerd::JobId& next_job_id, runnerd::JobScheduler& scheduler,
+                      runnerd::ProcessMonitor& process_monitor) {
   char buffer[4096];
   for (;;) {
     const ssize_t n = ::read(client_fd, buffer, sizeof(buffer));
@@ -329,7 +480,7 @@ bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
         const std::string request = connection.decoder.popFrame();
 
         const std::string response_payload =
-            handleRequest(request, jobs, next_job_id, process_monitor);
+            handleRequest(request, jobs, next_job_id, scheduler, process_monitor);
 
         const std::vector<char> response = runnerd::encodeFrame(response_payload);
 
@@ -361,12 +512,16 @@ bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  std::string socket_path;
+  DaemonOptions options;
+  std::string command_line_error;
 
-  if (!parseCommandLine(argc, argv, socket_path)) {
-    std::cerr << "Usage: " << argv[0] << " [--socket <path>]\n";
+  if (!parseCommandLine(argc, argv, options, command_line_error)) {
+    std::cerr << "runnerd error: " << command_line_error << '\n';
+    printUsage(argv[0]);
     return 1;
   }
+
+  const std::string& socket_path = options.socket_path;
 
   // 客户端提前断开连接时，
   // write 可能触发 SIGPIPE。
@@ -394,8 +549,18 @@ int main(int argc, char* argv[]) {
     // 任务表与 daemon 生命周期相同。
     // 客户端断开时不能删除任务。
     Jobs jobs;
+
+    // ProcessMonitor 必须在启动任何 Job 前构造，
+    // 因为构造函数会屏蔽 SIGCHLD 并创建 signalfd。
     runnerd::ProcessMonitor process_monitor(epoll_fd, jobs);
+
+    // Scheduler 不持有 JobTable，也不持有 ProcessMonitor。
+    // daemon 只是把两个独立模块放在同一个事件循环中协作。
+    runnerd::JobScheduler scheduler(options.max_running);
+
     runnerd::JobId next_job_id = 1;
+
+    std::cout << "maximum concurrent jobs: " << scheduler.maxRunning() << '\n';
 
     epoll_event listen_event{};
     listen_event.events = EPOLLIN;
@@ -450,7 +615,8 @@ int main(int argc, char* argv[]) {
           // EPOLLIN 表示有数据可读；EPOLLRDHUP 表示对端关闭了发送方向。
           // 两者可能同时出现，所以仍要调用 read 把对端最后发送的数据读完。
           if (connection_alive && (event_mask & (EPOLLIN | EPOLLRDHUP)) != 0) {
-            connection_alive = handleClientRead(fd, it->second, jobs, next_job_id, process_monitor);
+            connection_alive =
+                handleClientRead(fd, it->second, jobs, next_job_id, scheduler, process_monitor);
           }
 
           // EPOLLOUT 表示当前可以继续写。handleClientWrite 会从 write_offset

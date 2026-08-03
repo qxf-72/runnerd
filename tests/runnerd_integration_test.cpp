@@ -243,8 +243,10 @@ class RunnerdIntegrationTest : public ::testing::Test {
 
       ::close(log_fd);
 
+      const std::string max_running = maxRunningArgument();
+
       ::execl(RUNNERD_BINARY_PATH, RUNNERD_BINARY_PATH, "--socket", socket_path_.c_str(),
-              static_cast<char*>(nullptr));
+              "--max-running", max_running.c_str(), static_cast<char*>(nullptr));
       ::_exit(127);
     }
 
@@ -294,6 +296,10 @@ class RunnerdIntegrationTest : public ::testing::Test {
   std::string readServerLog() const {
     std::ifstream input(server_log_path_);
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  }
+
+  virtual std::string maxRunningArgument() const {
+    return "1";
   }
 
  private:
@@ -477,6 +483,96 @@ TEST_F(RunnerdIntegrationTest, ReportsNonzeroExitAndCapturedOutputForFailedJob) 
   EXPECT_NE(status.standard_output.find("stderr_bytes=3"), std::string::npos);
   EXPECT_NE(status.standard_output.find("error=process exited with code 7"), std::string::npos);
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, QueuesSecondLongRunningJobWhenMaximumIsOne) {
+  // sleep 时间足够长，确保测试查询状态时两个任务都尚未自然结束。
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  EXPECT_EQ(first_submit.standard_output, "1\n");
+
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  EXPECT_EQ(second_submit.standard_output, "2\n");
+
+  // 第一个任务取得唯一的运行槽位，因此已经被启动。
+  const ChildResult first_status = runClient({"status", "1"});
+  ASSERT_EQ(first_status.exit_code, 0) << first_status.standard_error;
+  EXPECT_NE(first_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << first_status.standard_output;
+
+  // 第二个任务虽然已经进入 JobTable，但没有空闲槽位，
+  // 所以必须保持 QUEUED，且不能被 ProcessMonitor 启动。
+  const ChildResult second_status = runClient({"status", "2"});
+  ASSERT_EQ(second_status.exit_code, 0) << second_status.standard_error;
+  EXPECT_NE(second_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << second_status.standard_output;
+
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+// 这个派生 Fixture 与基础 Fixture 唯一的不同：
+// 启动 daemon 时传入 --max-running 2。
+class RunnerdMaxTwoIntegrationTest : public RunnerdIntegrationTest {
+ protected:
+  std::string maxRunningArgument() const override {
+    return "2";
+  }
+};
+
+TEST_F(RunnerdMaxTwoIntegrationTest, StartsFirstTwoJobsAndQueuesThirdWhenMaximumIsTwo) {
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  const ChildResult third_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(third_submit.exit_code, 0) << third_submit.standard_error;
+
+  EXPECT_EQ(first_submit.standard_output, "1\n");
+  EXPECT_EQ(second_submit.standard_output, "2\n");
+  EXPECT_EQ(third_submit.standard_output, "3\n");
+
+  const ChildResult first_status = runClient({"status", "1"});
+  const ChildResult second_status = runClient({"status", "2"});
+  const ChildResult third_status = runClient({"status", "3"});
+
+  ASSERT_EQ(first_status.exit_code, 0) << first_status.standard_error;
+  ASSERT_EQ(second_status.exit_code, 0) << second_status.standard_error;
+  ASSERT_EQ(third_status.exit_code, 0) << third_status.standard_error;
+
+  EXPECT_NE(first_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << first_status.standard_output;
+
+  EXPECT_NE(second_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << second_status.standard_output;
+
+  EXPECT_NE(third_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << third_status.standard_output;
+
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST(RunnerdCommandLineTest, RejectsInvalidMaximumConcurrency) {
+  // 这些值都必须在创建 socket、创建 epoll 或启动子进程之前被拒绝。
+  const std::vector<std::string> invalid_values{
+      "0",
+      "-1",
+      "999999999999999999999999999999999999",
+  };
+
+  for (const std::string& value : invalid_values) {
+    ChildProcess daemon = ChildProcess::start({RUNNERD_BINARY_PATH, "--max-running", value});
+
+    const ChildResult result = daemon.finish();
+
+    EXPECT_NE(result.exit_code, 0) << "value: " << value;
+    EXPECT_NE(result.standard_error.find("--max-running"), std::string::npos)
+        << "value: " << value << "\nstderr:\n"
+        << result.standard_error;
+  }
 }
 
 }  // namespace

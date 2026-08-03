@@ -2,8 +2,9 @@
 
 任务状态机用于限制任务生命周期中的状态变化。目前状态定义、迁移检查和
 单元测试已经实现，并已接入 SUBMIT 流程：每个合法提交都会创建一个初始
-状态为 `QUEUED` 的任务，然后由 `ProcessMonitor` 启动并根据子进程结果
-迁移到 `RUNNING`、`SUCCEEDED` 或 `FAILED`。
+状态为 `QUEUED` 的任务并加入 `JobScheduler`。获得运行槽位的任务由
+`ProcessMonitor` 启动，并根据子进程结果迁移到 `RUNNING`、`SUCCEEDED`
+或 `FAILED`；没有空闲槽位的任务继续保持 `QUEUED`。
 
 ## 状态说明
 
@@ -83,6 +84,10 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取�
 
 - 合法 SUBMIT 会分配 JobId，并创建一个 `QUEUED` 任务。
 - 任务保存在 daemon 级别的 `Jobs` 表中，不属于某一条客户端连接。
+- `--max-running` 设置运行槽位数，默认值为 `1`；超出容量的任务按 FIFO
+  顺序保持 `QUEUED`。
+- 当前只在 SUBMIT 时调度任务；运行任务进入终态后释放槽位并自动启动队首
+  尚未接入 daemon。
 - 客户端断开后任务仍然执行并保留。
 - 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
   退出、信号终止或启动失败时进入 `FAILED`。
@@ -105,6 +110,10 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取�
 `tests/process_monitor_test.cpp` 还覆盖成功执行、stdout/stderr 采集、
 execve 失败、非零退出、大输出排空和多个子进程同时回收。
 
+`tests/job_scheduler_test.cpp` 覆盖非法最大并发数、FIFO 启动顺序、并发槽位、
+终态任务释放槽位、排队任务移除和重复调度保护。
+
 `tests/runnerd_integration_test.cpp` 通过真实 daemon 和 runnerctl 覆盖成功
 任务与失败任务的 STATUS 查询、非零退出码、stdout/stderr 字节数、LIST
-顺序、不存在的 JobId，以及非法 STATUS/LIST 参数。
+顺序、不存在的 JobId、非法 STATUS/LIST 参数，以及 `--max-running` 为 `1`
+或 `2` 时的初始排队行为和非法并发参数。

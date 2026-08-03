@@ -14,14 +14,17 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 
 当前已经实现 Unix Domain Socket 通信、长度前缀协议、非阻塞 `epoll`
 事件循环、连接读写状态、并发客户端测试、任务数据模型、状态机规则、
-进程启动、输出采集和子进程回收。
+进程启动、输出采集、子进程回收，以及 FIFO 调度器和初始并发槽位控制。
 
 `runnerctl` 已支持提交任务。runnerd 会解码并校验 `JobSpec`、分配 JobId，
-将任务保存到内存表并立即使用 `fork/execve` 启动。stdout/stderr 通过
-非阻塞 pipe 接入 `epoll`，`SIGCHLD` 通过 `signalfd` 接入事件循环，退出
-结果由 `waitpid` 结算。`status` 可以查询单个任务，`list` 会按 JobId
-顺序列出内存中的任务。当前没有 `cancel` 命令和并发上限；daemon 重启后
-内存任务、输出及 JobId 计数都会丢失。
+将任务保存到内存表并加入 FIFO 队列。`--max-running` 控制初始运行槽位，
+默认值为 `1`；超出容量的任务保持 `QUEUED`。stdout/stderr 通过非阻塞 pipe
+接入 `epoll`，`SIGCHLD` 通过 `signalfd` 接入事件循环，退出结果由 `waitpid`
+结算。`status` 可以查询单个任务，`list` 会按 JobId 顺序列出内存中的任务。
+
+当前阶段只在处理 SUBMIT 时调用调度器；运行任务结束后的槽位释放和 FIFO
+队首自动启动尚未接入 daemon。当前也没有 `cancel` 命令；daemon 重启后内存
+任务、输出及 JobId 计数都会丢失。
 
 ## 第一阶段核心功能
 
@@ -45,7 +48,8 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 
 ### 调度与可靠性
 
-- [ ] 最大并发数和等待队列
+- [x] `--max-running`、FIFO 等待队列和初始运行槽位控制
+- [ ] 任务结束后释放槽位并自动启动 FIFO 队首
 - [ ] 执行超时和手动取消
 - [ ] 任务历史持久化
 - [ ] runnerd 重启后的任务状态恢复
@@ -59,7 +63,16 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - [x] SUBMIT 编解码和顺序提交集成测试
 - [x] STATUS 编解码及 STATUS/LIST 集成测试
 - [x] 进程启动、输出采集、execve 失败和并发回收测试
+- [x] FIFO 调度器单元测试和最大并发初始排队集成测试
 - [ ] 任务取消、超时和恢复的集成测试
+
+## 当前 daemon 启动参数
+
+- 命令格式为
+  `runnerd [--socket <path>] [--max-running <positive-integer>]`。
+- `--socket` 默认使用 `/tmp/runnerd.sock`。
+- `--max-running` 默认使用 `1`，只接受不超出 `std::size_t` 的正整数。
+- 两个选项可以按任意顺序出现，但同一选项不能重复指定。
 
 ## 任务参数约束
 
@@ -77,14 +90,16 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
   `runnerctl [--socket <path>] submit [--timeout <ms>] -- <path> [args...]`。
 - `--` 后面的参数会保持各自边界，不会拼接成 shell 命令。
 - 服务端再次校验客户端输入，不依赖 `runnerctl` 的本地校验。
-- 合法任务获得从 1 开始递增的 JobId，以 `QUEUED` 状态保存后立即尝试启动。
+- 合法任务获得从 1 开始递增的 JobId，以 `QUEUED` 状态保存并加入 FIFO
+  等待队列；存在空闲槽位时立即尝试启动。
 - 启动成功后进入 `RUNNING`；正常退出码为 0 时进入 `SUCCEEDED`，否则进入
   `FAILED`。
 - stdout/stderr 当前保存在内存中，尚不能通过 `runnerctl` 查询，也没有
   输出大小上限。
 - 客户端连接关闭不会删除或终止任务。
 - timeout 当前只被保存，不会触发计时或终止。
-- 当前没有调度队列和并发限制，每个合法任务都会立即尝试启动。
+- 当前只在 SUBMIT 处理过程中分配槽位。运行任务结束后尚未释放调度器槽位，
+  因此已经排队的任务不会自动启动；这部分接入属于下一阶段工作。
 - 所有任务、输出和结果仍只存在于 daemon 内存中。
 
 ## 当前查询行为
