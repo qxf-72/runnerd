@@ -417,6 +417,26 @@ TEST_F(RunnerdIntegrationTest, RejectsInvalidStatusAndListArguments) {
   EXPECT_NE(extra_list_argument.standard_error.find("does not accept"), std::string::npos);
 }
 
+TEST_F(RunnerdIntegrationTest, RejectsInvalidCancelArguments) {
+  const ChildResult missing_id = runClient({"cancel"});
+  EXPECT_NE(missing_id.exit_code, 0);
+  EXPECT_NE(missing_id.standard_error.find("requires a job id"), std::string::npos);
+
+  const ChildResult zero_id = runClient({"cancel", "0"});
+  EXPECT_NE(zero_id.exit_code, 0);
+  EXPECT_NE(zero_id.standard_error.find("greater than zero"), std::string::npos);
+
+  const ChildResult invalid_id = runClient({"cancel", "abc"});
+  EXPECT_NE(invalid_id.exit_code, 0);
+  EXPECT_NE(invalid_id.standard_error.find("positive integer"), std::string::npos);
+
+  const ChildResult extra_argument = runClient({"cancel", "1", "extra"});
+  EXPECT_NE(extra_argument.exit_code, 0);
+  EXPECT_NE(extra_argument.standard_error.find("exactly one"), std::string::npos);
+
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
 TEST_F(RunnerdIntegrationTest, ReportsStatusAndListsJobsInIdOrder) {
   const ChildResult first_submit = runClient({"submit", "--", "/bin/echo", "hello"});
 
@@ -532,6 +552,124 @@ TEST_F(RunnerdIntegrationTest, QueuesSecondLongRunningJobWhenMaximumIsOne) {
   EXPECT_NE(second_status.standard_output.find("state=QUEUED"), std::string::npos)
       << second_status.standard_output;
 
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, CancelsQueuedJobAndReportsCancelledState) {
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(first_submit.standard_output, "1\n");
+  ASSERT_EQ(second_submit.standard_output, "2\n");
+
+  const ChildResult queued_status = runClient({"status", "2"});
+  ASSERT_EQ(queued_status.exit_code, 0) << queued_status.standard_error;
+  ASSERT_NE(queued_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << queued_status.standard_output;
+
+  const ChildResult cancellation = runClient({"cancel", "2"});
+  ASSERT_EQ(cancellation.exit_code, 0) << cancellation.standard_error;
+  EXPECT_EQ(cancellation.standard_output, "Cancelled job 2\n");
+
+  // CANCEL 必须同时更新 JobTable 和 Scheduler：对外状态变为终态，
+  // 后续也不能再被调度器取出启动。
+  const ChildResult cancelled_status = runClient({"status", "2"});
+  ASSERT_EQ(cancelled_status.exit_code, 0) << cancelled_status.standard_error;
+  EXPECT_NE(cancelled_status.standard_output.find("state=CANCELLED"), std::string::npos)
+      << cancelled_status.standard_output;
+
+  const ChildResult list = runClient({"list"});
+  ASSERT_EQ(list.exit_code, 0) << list.standard_error;
+  EXPECT_NE(list.standard_output.find("id=2 state=CANCELLED"), std::string::npos)
+      << list.standard_output;
+
+  const ChildResult first_status = runClient({"status", "1"});
+  ASSERT_EQ(first_status.exit_code, 0) << first_status.standard_error;
+  EXPECT_NE(first_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << first_status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, CancellingMiddleQueuedJobPreservesFifoProgress) {
+  // Job 1 暂时占用唯一槽位，确保 Job 2 和 Job 3 都先进入等待队列。
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "1"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  const ChildResult third_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(third_submit.exit_code, 0) << third_submit.standard_error;
+
+  const ChildResult second_status_before = runClient({"status", "2"});
+  const ChildResult third_status_before = runClient({"status", "3"});
+  ASSERT_EQ(second_status_before.exit_code, 0) << second_status_before.standard_error;
+  ASSERT_EQ(third_status_before.exit_code, 0) << third_status_before.standard_error;
+  ASSERT_NE(second_status_before.standard_output.find("state=QUEUED"), std::string::npos)
+      << second_status_before.standard_output;
+  ASSERT_NE(third_status_before.standard_output.find("state=QUEUED"), std::string::npos)
+      << third_status_before.standard_output;
+
+  const ChildResult cancellation = runClient({"cancel", "2"});
+  ASSERT_EQ(cancellation.exit_code, 0) << cancellation.standard_error;
+
+  // 从队列中间删除 Job 2 后，Job 1 结束释放的槽位必须交给 Job 3。
+  const ChildResult third_status = waitForJobState("3", "RUNNING");
+  ASSERT_EQ(third_status.exit_code, 0)
+      << third_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(third_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << third_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+
+  const ChildResult second_status_after = runClient({"status", "2"});
+  ASSERT_EQ(second_status_after.exit_code, 0) << second_status_after.standard_error;
+  EXPECT_NE(second_status_after.standard_output.find("state=CANCELLED"), std::string::npos)
+      << second_status_after.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, RejectsMissingRunningTerminalAndRepeatedCancellation) {
+  const ChildResult missing = runClient({"cancel", "999"});
+  EXPECT_NE(missing.exit_code, 0);
+  EXPECT_NE(missing.standard_error.find("job not found"), std::string::npos);
+
+  const ChildResult completed_submit = runClient({"submit", "--", "/bin/true"});
+  ASSERT_EQ(completed_submit.exit_code, 0) << completed_submit.standard_error;
+
+  const ChildResult completed_status = waitForJobState("1", "SUCCEEDED");
+  ASSERT_EQ(completed_status.exit_code, 0)
+      << completed_status.standard_error << "\nserver log:\n" << readServerLog();
+
+  const ChildResult terminal = runClient({"cancel", "1"});
+  EXPECT_NE(terminal.exit_code, 0);
+  EXPECT_NE(terminal.standard_error.find("already terminal"), std::string::npos);
+
+  const ChildResult running_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  ASSERT_EQ(running_submit.exit_code, 0) << running_submit.standard_error;
+
+  const ChildResult running_status = waitForJobState("2", "RUNNING");
+  ASSERT_EQ(running_status.exit_code, 0) << running_status.standard_error;
+
+  const ChildResult running = runClient({"cancel", "2"});
+  EXPECT_NE(running.exit_code, 0);
+  EXPECT_NE(running.standard_error.find("running job cancellation is not available yet"),
+            std::string::npos);
+
+  const ChildResult queued_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  ASSERT_EQ(queued_submit.exit_code, 0) << queued_submit.standard_error;
+
+  const ChildResult queued_status = runClient({"status", "3"});
+  ASSERT_EQ(queued_status.exit_code, 0) << queued_status.standard_error;
+  ASSERT_NE(queued_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << queued_status.standard_output;
+
+  const ChildResult first_cancel = runClient({"cancel", "3"});
+  ASSERT_EQ(first_cancel.exit_code, 0) << first_cancel.standard_error;
+
+  const ChildResult repeated_cancel = runClient({"cancel", "3"});
+  EXPECT_NE(repeated_cancel.exit_code, 0);
+  EXPECT_NE(repeated_cancel.standard_error.find("already terminal"), std::string::npos);
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 

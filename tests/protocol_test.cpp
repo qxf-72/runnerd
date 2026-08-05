@@ -136,6 +136,52 @@ TEST(StatusProtocolTest, RejectsMalformedRequests) {
   EXPECT_THROW(runnerd::decodeStatusRequest(wrong_marker), std::invalid_argument);
 }
 
+TEST(CancelProtocolTest, RoundTripsBigEndianJobId) {
+  const runnerd::JobId job_id = static_cast<runnerd::JobId>(0x0102030405060708ULL);
+
+  const std::string payload = runnerd::encodeCancelRequest(job_id);
+
+  ASSERT_EQ(payload.size(), 14U);
+  EXPECT_EQ(payload.compare(0, 6, "CANCEL"), 0);
+
+  // JobId 按照网络大端序写入：最高有效字节 0x01 最先出现。
+  EXPECT_EQ(static_cast<unsigned char>(payload[6]), 0x01U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[7]), 0x02U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[8]), 0x03U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[9]), 0x04U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[10]), 0x05U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[11]), 0x06U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[12]), 0x07U);
+  EXPECT_EQ(static_cast<unsigned char>(payload[13]), 0x08U);
+
+  EXPECT_TRUE(runnerd::isCancelRequest(payload));
+  EXPECT_EQ(runnerd::decodeCancelRequest(payload), job_id);
+}
+
+TEST(CancelProtocolTest, RejectsMalformedRequests) {
+  EXPECT_THROW(runnerd::encodeCancelRequest(0), std::invalid_argument);
+
+  // 连命令前缀都不完整时，不应被识别成 CANCEL。
+  EXPECT_FALSE(runnerd::isCancelRequest("CANCE"));
+  EXPECT_THROW(runnerd::decodeCancelRequest("CANCE"), std::invalid_argument);
+
+  // 只有 CANCEL 前缀、没有 JobId，属于已经识别但结构被截断的请求。
+  EXPECT_TRUE(runnerd::isCancelRequest("CANCEL"));
+  EXPECT_THROW(runnerd::decodeCancelRequest("CANCEL"), std::invalid_argument);
+
+  std::string zero_job_id("CANCEL", 6);
+  zero_job_id.append(sizeof(runnerd::JobId), '\0');
+  EXPECT_THROW(runnerd::decodeCancelRequest(zero_job_id), std::invalid_argument);
+
+  std::string trailing_bytes = runnerd::encodeCancelRequest(1);
+  trailing_bytes.push_back('x');
+  EXPECT_THROW(runnerd::decodeCancelRequest(trailing_bytes), std::invalid_argument);
+
+  std::string wrong_marker = runnerd::encodeCancelRequest(1);
+  wrong_marker[0] = 'X';
+  EXPECT_THROW(runnerd::decodeCancelRequest(wrong_marker), std::invalid_argument);
+}
+
 TEST(FrameEncodingTest, UsesBigEndianPayloadLength) {
   const std::vector<char> frame = runnerd::encodeFrame("PING");
 
