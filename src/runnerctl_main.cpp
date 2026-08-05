@@ -21,12 +21,7 @@ namespace {
 
 constexpr const char* kDefaultSocketPath = "/tmp/runnerd.sock";
 
-enum class Command {
-  kPing,
-  kSubmit,
-  kStatus,
-  kList,
-};
+enum class Command { kPing, kSubmit, kStatus, kList, kCancel };
 
 struct CommandLine {
   std::string socket_path = kDefaultSocketPath;
@@ -35,7 +30,7 @@ struct CommandLine {
 
   runnerd::JobSpec job_spec;
 
-  // 只在 status 命令中使用。
+  // status 和 cancel 命令都会使用 JobId。
   runnerd::JobId job_id = 0;
 };
 
@@ -46,7 +41,8 @@ void printUsage(const char* program_name) {
             << "[--timeout <milliseconds>] "
             << "-- <absolute-path> [arguments...]\n"
             << "  " << program_name << " [--socket <path>] status <job_id>\n"
-            << "  " << program_name << " [--socket <path>] list\n";
+            << "  " << program_name << " [--socket <path>] list\n"
+            << "  " << program_name << " [--socket <path>] cancel <job_id>\n";
 }
 
 // 只接受十进制正整数，并在计算过程中检查 uint32_t 溢出。
@@ -194,6 +190,28 @@ bool parseCommandLine(int argc, char* argv[], CommandLine& command_line, std::st
     return true;
   }
 
+  if (command == "cancel") {
+    command_line.command = Command::kCancel;
+
+    if (index >= argc) {
+      error = "cancel requires a job id";
+      return false;
+    }
+
+    if (!parseJobId(argv[index], command_line.job_id, error)) {
+      return false;
+    }
+
+    ++index;
+
+    if (index != argc) {
+      error = "cancel accepts exactly one job id";
+      return false;
+    }
+
+    return true;
+  }
+
   if (command != "submit") {
     error = "unknown command: " + command;
     return false;
@@ -262,6 +280,8 @@ std::string makeRequestPayload(const CommandLine& command_line) {
       return runnerd::encodeStatusRequest(command_line.job_id);
     case Command::kList:
       return "LIST";
+    case Command::kCancel:
+      return runnerd::encodeCancelRequest(command_line.job_id);
   }
 
   throw std::logic_error("unknown command");
@@ -360,7 +380,8 @@ bool parseSubmitSuccessResponse(const std::string& response, runnerd::JobId& job
   return true;
 }
 
-bool handleResponse(Command command, const std::string& response) {
+bool handleResponse(const CommandLine& command_line, const std::string& response) {
+  const Command command = command_line.command;
   if (isErrorResponse(response)) {
     if (response == "ERR") {
       std::cerr << "server error\n";
@@ -416,6 +437,15 @@ bool handleResponse(Command command, const std::string& response) {
 
       std::cout << response.substr(3) << '\n';
       return true;
+
+    case Command::kCancel:
+      if (response != "OK cancelled") {
+        std::cerr << "unexpected response: " << response << '\n';
+        return false;
+      }
+      std::cout << "Cancelled job " << command_line.job_id << '\n';
+
+      return true;
   }
 
   return false;
@@ -458,7 +488,7 @@ int main(int argc, char* argv[]) {
           "sending a complete response");
     }
 
-    const bool succeeded = handleResponse(command_line.command, response);
+    const bool succeeded = handleResponse(command_line, response);
 
     ::close(socket_fd);
 

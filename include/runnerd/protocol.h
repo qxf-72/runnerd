@@ -33,6 +33,16 @@ std::string encodeStatusRequest(JobId job_id);
 // 从 STATUS payload 中还原 JobId。
 JobId decodeStatusRequest(const std::string& payload);
 
+// 判断 payload 是否使用 CANCEL 请求格式。
+bool isCancelRequest(const std::string& payload);
+
+// 将 JobId 编码为 CANCEL payload。
+// 返回值不包含外层的 4 字节帧头。
+std::string encodeCancelRequest(JobId job_id);
+
+// 从 CANCEL payload 中还原 JobId。
+JobId decodeCancelRequest(const std::string& payload);
+
 // 将 payload 编码为“4 字节大端长度 + payload”。
 std::vector<char> encodeFrame(const std::string& payload);
 

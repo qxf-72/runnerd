@@ -18,6 +18,10 @@ constexpr char kStatusCommand[] = "STATUS";
 constexpr std::size_t kStatusCommandSize = sizeof(kStatusCommand) - 1;
 constexpr std::size_t kStatusRequestSize = kStatusCommandSize + sizeof(JobId);
 
+constexpr char kCancelCommand[] = "CANCEL";
+constexpr std::size_t kCancelCommandSize = sizeof(kCancelCommand) - 1;
+constexpr std::size_t kCancelRequestSize = kCancelCommandSize + sizeof(JobId);
+
 // 将 uint32_t 以大端序追加到字符串。
 // std::string 可以保存 '\0'，因此可以作为二进制缓冲区。
 void appendUint32(std::string& output, std::uint32_t value) {
@@ -208,6 +212,59 @@ JobId decodeStatusRequest(const std::string& payload) {
   JobId job_id = 0;
 
   for (std::size_t index = kStatusCommandSize; index < payload.size(); ++index) {
+    const auto byte = static_cast<unsigned char>(payload[index]);
+
+    job_id = (job_id << 8U) | static_cast<JobId>(byte);
+  }
+
+  if (job_id == 0) {
+    throw std::invalid_argument("job id must be greater than zero");
+  }
+
+  return job_id;
+}
+
+bool isCancelRequest(const std::string& payload) {
+  return payload.size() >= kCancelCommandSize &&
+         payload.compare(0, kCancelCommandSize, kCancelCommand) == 0;
+}
+
+std::string encodeCancelRequest(JobId job_id) {
+  // JobId 0 在 runnerd 中不是合法任务编号。
+  // 客户端提前拒绝，服务端解码后也会再次拒绝。
+  if (job_id == 0) {
+    throw std::invalid_argument("job id must be greater than zero");
+  }
+
+  std::string payload;
+
+  // CANCEL 固定为 6 字节，JobId 固定为 8 字节。
+  payload.reserve(kCancelRequestSize);
+
+  payload.append(kCancelCommand, kCancelCommandSize);
+
+  appendJobId(payload, job_id);
+
+  return payload;
+}
+
+JobId decodeCancelRequest(const std::string& payload) {
+  if (!isCancelRequest(payload)) {
+    throw std::invalid_argument("payload is not a CANCEL request");
+  }
+
+  // 不能只检查前缀。
+  //
+  // "CANCEL" 后必须刚好跟随 8 字节 JobId：
+  // 少了是截断，多了则说明协议格式不一致。
+  if (payload.size() != kCancelRequestSize) {
+    throw std::invalid_argument("CANCEL request has invalid size");
+  }
+
+  JobId job_id = 0;
+
+  // 按网络大端序逐字节恢复 JobId。
+  for (std::size_t index = kCancelCommandSize; index < payload.size(); ++index) {
     const auto byte = static_cast<unsigned char>(payload[index]);
 
     job_id = (job_id << 8U) | static_cast<JobId>(byte);

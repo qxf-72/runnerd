@@ -405,6 +405,60 @@ std::string makeListResponse(const Jobs& jobs) {
   return response;
 }
 
+// 取消一个任务。
+std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& scheduler) {
+  const auto job_it = jobs.find(job_id);
+
+  if (job_it == jobs.end()) {
+    return "ERR job not found";
+  }
+
+  runnerd::Job& job = job_it->second;
+
+  if (job.state == runnerd::JobState::kQueued) {
+    // 先从 Scheduler 移除，再修改 JobState。
+    // 这样不会留下“状态是 CANCELLED，却仍在 FIFO 队列中”的任务。
+    if (!scheduler.cancelQueuedJob(job_id)) {
+      // Job 表示自己是 QUEUED，但 Scheduler 找不到它，
+      // 说明 daemon 内部的两个数据结构失去一致性。
+      throw std::logic_error("queued job is missing from scheduler");
+    }
+
+    // QUEUED -> CANCELLED 是 Job 状态机允许的迁移。
+    transitionJob(job, runnerd::JobState::kCancelled);
+
+    std::cout << "cancelled queued job " << job_id << '\n';
+
+    return "OK cancelled";
+  }
+
+  if (job.state == runnerd::JobState::kRunning) {
+    // 以后才会实现：
+    //
+    // RUNNING -> TERMINATING
+    // kill(-process_group_id, SIGTERM)
+    // 继续 drain stdout/stderr
+    // 最终 TERMINATING -> CANCELLED
+    //
+    // 今天绝对不能假装已经取消成功，
+    // 因为此时子进程仍会继续运行。
+    return "ERR running job cancellation is not available yet";
+  }
+
+  if (job.state == runnerd::JobState::kTerminating) {
+    // 当前版本暂时不会通过 CANCEL 进入 TERMINATING，
+    // 但状态机已经定义了这个状态。
+    // 提前给出稳定错误，避免未来出现模糊行为。
+    return "ERR job is already terminating";
+  }
+
+  if (runnerd::isTerminal(job.state)) {
+    return "ERR job is already terminal";
+  }
+
+  throw std::logic_error("unknown non-terminal job state during cancellation");
+}
+
 std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id,
                           runnerd::JobScheduler& scheduler,
                           runnerd::ProcessMonitor& process_monitor) {
@@ -428,6 +482,18 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
 
       return makeStatusResponse(iterator->second);
     } catch (const std::invalid_argument& exception) {
+      return std::string("ERR ") + exception.what();
+    }
+  }
+
+  if (runnerd::isCancelRequest(request)) {
+    try {
+      const runnerd::JobId job_id = runnerd::decodeCancelRequest(request);
+
+      return cancelJob(job_id, jobs, scheduler);
+    } catch (const std::invalid_argument& exception) {
+      // 客户端发送的是 CANCEL 前缀，但二进制结构不合法。
+      // 这属于普通协议错误，不应该让 daemon 退出。
       return std::string("ERR ") + exception.what();
     }
   }
