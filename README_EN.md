@@ -106,9 +106,8 @@ the job's `argv`. The executable (`argv[0]`) must be an absolute path.
   to supervise it.
 - The daemon captures stdout/stderr, but `runnerctl` currently exposes status and
   metadata only, not the output content.
-- Execution slots are currently assigned only when SUBMIT is handled. Releasing
-  a slot and automatically starting the FIFO head after a job finishes is the
-  next integration step.
+- When a running job reaches a terminal state, its execution slot is released and
+  the daemon immediately starts the FIFO head of the waiting queue.
 
 ## 🏗️ Architecture
 
@@ -143,6 +142,7 @@ flowchart TB
         Signal -->|"child-exit event"| Loop
         Loop -->|"dispatch fd / signal event"| Monitor
         Monitor -->|"state and output updates"| Jobs
+        Monitor -->|"terminal notification · release slot"| Scheduler
     end
 
     Socket <-->|"read / write"| Loop
@@ -157,6 +157,8 @@ a slot is available, the scheduler hands the FIFO head to `ProcessMonitor` for
 launch and supervision. `STATUS` and `LIST` read only from the in-memory job
 table. A client disconnect does not terminate a submitted job. A job is settled
 only after its child has exited and every monitored pipe reaches EOF.
+`ProcessMonitor` then notifies the daemon to release the execution slot, after
+which the daemon starts the FIFO head of the waiting queue.
 
 ## 🧩 Project Structure
 
@@ -233,7 +235,7 @@ limitations are current behavior, not hidden trade-offs:
 | Area | Current behavior |
 | --- | --- |
 | Timeouts | `--timeout` is validated and stored in `JobSpec`, but does not terminate jobs yet. |
-| Scheduling | `--max-running` limits initial concurrency and excess jobs remain `QUEUED` in FIFO order; slot release and automatic queue advancement after completion are not wired in yet. |
+| Scheduling | `--max-running` limits concurrent execution; excess jobs remain `QUEUED` in FIFO order, and settlement automatically releases a slot and starts the queue head. |
 | Job data | Job metadata and captured output exist only in memory and are lost after restart. |
 | Output | stdout/stderr are captured, but cannot yet be queried through `runnerctl`; no size limit is applied. |
 | Control | There is no cancellation command. |
@@ -281,7 +283,7 @@ The project requires C++17 and disables compiler extensions. Every target uses
 | `job_scheduler_test` | FIFO order, execution slots, slot release, and queued-job removal |
 | `process_launcher_test` | `fork/execve`, pipes, process groups, and startup failures |
 | `process_monitor_test` | Output capture, settlement, large output, and concurrent reaping |
-| `runnerd_integration_test` | A real daemon, concurrent PING, job queries, and initial max-concurrency queuing |
+| `runnerd_integration_test` | A real daemon, concurrent PING, job queries, bounded concurrency, FIFO advancement, and continued scheduling after failures |
 
 ## 📚 Documentation
 
@@ -298,8 +300,7 @@ The project requires C++17 and disables compiler extensions. Every target uses
 - [x] Job model, state machine, and in-memory job table
 - [x] `fork/execve` launch, process groups, output capture, and reaping
 - [x] `STATUS` and `LIST` queries
-- [x] FIFO waiting queue, `--max-running`, and initial execution-slot control
-- [ ] Release slots and automatically start the FIFO head after job completion
+- [x] FIFO waiting queue, `--max-running`, terminal slot release, and automatic queue advancement
 - [ ] Enforced timeouts, cancellation, bounded output, and output retrieval
 - [ ] Persistent job history and restart recovery
 - [ ] More failure-path integration tests, Sanitizer checks, and diagnostics

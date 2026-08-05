@@ -86,8 +86,9 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取�
 - 任务保存在 daemon 级别的 `Jobs` 表中，不属于某一条客户端连接。
 - `--max-running` 设置运行槽位数，默认值为 `1`；超出容量的任务按 FIFO
   顺序保持 `QUEUED`。
-- 当前只在 SUBMIT 时调度任务；运行任务进入终态后释放槽位并自动启动队首
-  尚未接入 daemon。
+- 运行任务最终结算后，`ProcessMonitor` 会通知 daemon 释放运行槽位；daemon
+  随后继续调度，按 FIFO 顺序启动下一个等待任务。
+- 如果任务在同步启动阶段失败，daemon 会立即释放槽位并继续调度后续任务。
 - 客户端断开后任务仍然执行并保留。
 - 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
   退出、信号终止或启动失败时进入 `FAILED`。
@@ -116,4 +117,6 @@ execve 失败、非零退出、大输出排空和多个子进程同时回收。
 `tests/runnerd_integration_test.cpp` 通过真实 daemon 和 runnerctl 覆盖成功
 任务与失败任务的 STATUS 查询、非零退出码、stdout/stderr 字节数、LIST
 顺序、不存在的 JobId、非法 STATUS/LIST 参数，以及 `--max-running` 为 `1`
-或 `2` 时的初始排队行为和非法并发参数。
+或 `2` 时的并发限制和非法并发参数。还覆盖成功退出、非零退出及 `execve`
+失败后的队列自动推进、FIFO 启动顺序，以及多个任务快速退出时槽位不会泄漏
+或重复释放。

@@ -101,8 +101,7 @@ cmake --build build --parallel
   而是作为普通参数传给目标程序。
 - 客户端断开连接不会取消已提交的任务；任务仍由 daemon 继续监管。
 - daemon 会采集 stdout/stderr，但当前 `runnerctl` 只能查询状态和元数据，不能读取输出正文。
-- 当前只在收到 SUBMIT 时分配运行槽位；运行任务结束后释放槽位并自动启动队首任务
-  将在下一阶段接入。
+- 运行任务进入终态后会释放运行槽位，daemon 随即按 FIFO 顺序启动等待队首。
 
 ## 🏗️ 架构
 
@@ -137,6 +136,7 @@ flowchart TB
         Signal -->|"子进程退出事件"| Loop
         Loop -->|"分派 fd / 信号事件"| Monitor
         Monitor -->|"更新状态与输出"| Jobs
+        Monitor -->|"终态通知 · 释放槽位"| Scheduler
     end
 
     Socket <-->|"读取 / 写入"| Loop
@@ -149,6 +149,7 @@ flowchart TB
 `SUBMIT` 创建任务并加入 `JobScheduler`；调度器在有空闲槽位时把 FIFO 队首交给
 `ProcessMonitor` 启动与监管。`STATUS` 和 `LIST` 只读取内存任务表。客户端断开连接
 不会终止已提交的任务；只有子进程退出且所有受监控管道均到达 EOF 后，任务才会结算。
+`ProcessMonitor` 随后通知 daemon 释放运行槽位，daemon 再继续启动 FIFO 队首任务。
 
 ## 🧩 项目结构
 
@@ -221,7 +222,7 @@ QUEUED ──> RUNNING ──> SUCCEEDED
 | 领域 | 当前行为 |
 | --- | --- |
 | 超时 | `--timeout` 会被校验并保存到 `JobSpec`，但目前不会终止超时任务。 |
-| 调度 | `--max-running` 限制初始并发数，超额任务按 FIFO 保持 `QUEUED`；任务结束后的槽位释放和队列自动推进尚未接入。 |
+| 调度 | `--max-running` 限制并发运行数；超额任务按 FIFO 保持 `QUEUED`，运行任务结算后自动释放槽位并启动队首。 |
 | 任务数据 | 任务元数据和已采集输出仅保存在内存中，daemon 重启后丢失。 |
 | 输出 | stdout/stderr 会被采集，但暂不能通过 `runnerctl` 查询，且未设大小上限。 |
 | 控制 | 尚无取消任务命令。 |
@@ -268,7 +269,7 @@ cmake --build build --parallel
 | `job_scheduler_test` | FIFO 顺序、并发槽位、槽位释放和排队任务移除 |
 | `process_launcher_test` | `fork/execve`、管道、进程组和启动失败 |
 | `process_monitor_test` | 输出采集、结算、大输出和并发回收 |
-| `runnerd_integration_test` | 真实 daemon、并发 PING、任务查询及最大并发初始排队 |
+| `runnerd_integration_test` | 真实 daemon、并发 PING、任务查询、最大并发、FIFO 自动推进及失败后继续调度 |
 
 ## 📚 文档
 
@@ -285,8 +286,7 @@ cmake --build build --parallel
 - [x] 任务模型、状态机和内存任务表
 - [x] `fork/execve` 启动、进程组、输出采集和回收
 - [x] `STATUS` 与 `LIST` 查询
-- [x] FIFO 等待队列、`--max-running` 与初始运行槽位控制
-- [ ] 任务结束后释放槽位并自动启动 FIFO 队首
+- [x] FIFO 等待队列、`--max-running`、终态槽位释放与队列自动推进
 - [ ] 强制超时、取消任务、有界输出和输出查询
 - [ ] 任务历史持久化与重启恢复
 - [ ] 更多失败路径的集成测试、Sanitizer 检查和诊断报告
