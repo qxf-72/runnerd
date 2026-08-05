@@ -289,6 +289,28 @@ class RunnerdIntegrationTest : public ::testing::Test {
     return process.finish();
   }
 
+  ChildResult waitForJobState(const std::string& job_id,
+                              const std::string& expected_state) const {
+    ChildResult status;
+    const std::string expected_text = "state=" + expected_state;
+
+    // 不使用固定 sleep 猜测任务何时完成，而是轮询对外可见的 STATUS。
+    // 200 * 20 ms 给正常 CI 环境最多约 4 秒的调度时间，
+    // 同时仍低于该集成测试的 10 秒 CTest 超时。
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      status = runClient({"status", job_id});
+
+      if (status.exit_code != 0 ||
+          status.standard_output.find(expected_text) != std::string::npos) {
+        return status;
+      }
+
+      ::usleep(20'000);
+    }
+
+    return status;
+  }
+
   bool serverIsRunning() const {
     return server_pid_ > 0 && ::kill(server_pid_, 0) == 0;
   }
@@ -552,6 +574,150 @@ TEST_F(RunnerdMaxTwoIntegrationTest, StartsFirstTwoJobsAndQueuesThirdWhenMaximum
   EXPECT_NE(third_status.standard_output.find("state=QUEUED"), std::string::npos)
       << third_status.standard_output;
 
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, StartsNextQueuedJobAfterSuccessfulCompletion) {
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "0.2"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(first_submit.standard_output, "1\n");
+  ASSERT_EQ(second_submit.standard_output, "2\n");
+
+  const ChildResult second_status = waitForJobState("2", "RUNNING");
+
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << second_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+
+  const ChildResult first_status = runClient({"status", "1"});
+
+  ASSERT_EQ(first_status.exit_code, 0) << first_status.standard_error;
+  EXPECT_NE(first_status.standard_output.find("state=SUCCEEDED"), std::string::npos)
+      << first_status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, StartsNextQueuedJobAfterNonzeroExit) {
+  const ChildResult first_submit =
+      runClient({"submit", "--", "/bin/sh", "-c", "sleep 0.2; exit 7"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+
+  const ChildResult first_status = waitForJobState("1", "FAILED");
+  ASSERT_EQ(first_status.exit_code, 0)
+      << first_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(first_status.standard_output.find("state=FAILED"), std::string::npos)
+      << first_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_NE(first_status.standard_output.find("exit_code=7"), std::string::npos)
+      << first_status.standard_output;
+
+  const ChildResult second_status = waitForJobState("2", "RUNNING");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << second_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, StartsNextJobAfterExecveFailure) {
+  const ChildResult first_submit =
+      runClient({"submit", "--", "/definitely/not/a/runnerd-test-executable"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+
+  const ChildResult first_status = waitForJobState("1", "FAILED");
+  ASSERT_EQ(first_status.exit_code, 0)
+      << first_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(first_status.standard_output.find("state=FAILED"), std::string::npos)
+      << first_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_NE(first_status.standard_output.find("execve"), std::string::npos)
+      << first_status.standard_output;
+
+  const ChildResult second_status = waitForJobState("2", "RUNNING");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << second_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, StartsQueuedJobsInFifoOrder) {
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "0.2"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  const ChildResult third_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(third_submit.exit_code, 0) << third_submit.standard_error;
+
+  // Job 1 结束后只能释放一个槽位。FIFO 队首 Job 2 必须先启动，
+  // Job 3 则继续等待，直到 Job 2 也进入终态。
+  const ChildResult second_status = waitForJobState("2", "RUNNING");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << second_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+
+  const ChildResult third_status = runClient({"status", "3"});
+  ASSERT_EQ(third_status.exit_code, 0) << third_status.standard_error;
+  EXPECT_NE(third_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << third_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, HandlesRapidExitsWithoutLeakingOrDoubleReleasingSlots) {
+  constexpr int kQuickJobCount = 8;
+
+  // 先用一个短 sleep 占住唯一槽位，让后续 /bin/true 都进入队列。
+  const ChildResult first_submit = runClient({"submit", "--", "/bin/sleep", "0.2"});
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+
+  for (int job_id = 2; job_id <= kQuickJobCount; ++job_id) {
+    const ChildResult submit = runClient({"submit", "--", "/bin/true"});
+
+    ASSERT_EQ(submit.exit_code, 0) << "job " << job_id << ": " << submit.standard_error;
+    EXPECT_EQ(submit.standard_output, std::to_string(job_id) + "\n");
+  }
+
+  // 最后一个快速任务能够完成，说明前面的终态通知都只释放了一次槽位，
+  // 且 FIFO 队列没有因快速 SIGCHLD / pipe EOF 事件而卡住。
+  const ChildResult last_quick_status =
+      waitForJobState(std::to_string(kQuickJobCount), "SUCCEEDED");
+
+  ASSERT_EQ(last_quick_status.exit_code, 0)
+      << last_quick_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(last_quick_status.standard_output.find("state=SUCCEEDED"), std::string::npos)
+      << last_quick_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+
+  // 队列排空后还应能正常占用一个新槽位。
+  const int final_job_id = kQuickJobCount + 1;
+  const ChildResult final_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(final_submit.exit_code, 0) << final_submit.standard_error;
+  EXPECT_EQ(final_submit.standard_output, std::to_string(final_job_id) + "\n");
+
+  const ChildResult final_status = waitForJobState(std::to_string(final_job_id), "RUNNING");
+  ASSERT_EQ(final_status.exit_code, 0)
+      << final_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(final_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << final_status.standard_output << "\nserver log:\n"
+      << readServerLog();
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
