@@ -40,6 +40,7 @@ purpose scheduler or remote execution platform.
 | Reliable framing | A length-prefixed protocol with incremental decoding handles partial, coalesced, and binary payloads. |
 | Process supervision | Jobs use `fork/execve` and a separate process group; no shell is involved. |
 | Bounded concurrency | `--max-running` configures execution slots; excess jobs enter a FIFO waiting queue. |
+| Queued cancellation | `runnerctl cancel` safely removes jobs that have not started and marks them `CANCELLED`. |
 | Observable lifecycle | `signalfd + waitpid` and non-blocking stdout/stderr pipes drive a documented job state machine. |
 | Tested behavior | GoogleTest and CTest cover protocol, state transitions, process launch, monitoring, and end-to-end flows. |
 
@@ -108,6 +109,8 @@ the job's `argv`. The executable (`argv[0]`) must be an absolute path.
   metadata only, not the output content.
 - When a running job reaches a terminal state, its execution slot is released and
   the daemon immediately starts the FIFO head of the waiting queue.
+- `runnerctl cancel <job_id>` currently cancels only jobs that are still `QUEUED`;
+  it does not terminate running jobs.
 
 ## 🏗️ Architecture
 
@@ -133,10 +136,12 @@ flowchart TB
         Route -->|"PING"| Reply
         Route -->|"SUBMIT"| Jobs
         Route -->|"STATUS / LIST"| Jobs
-        Jobs -->|"query result"| Reply
+        Route -->|"CANCEL"| Jobs
+        Jobs -->|"result"| Reply
         Reply -->|"write response"| Loop
 
         Jobs -->|"enqueue"| Scheduler
+        Jobs -->|"cancel queued job"| Scheduler
         Scheduler -->|"grant start slot"| Monitor --> Launcher
         Pipes -->|"output / startup-error event"| Loop
         Signal -->|"child-exit event"| Loop
@@ -183,6 +188,7 @@ which the daemon starts the FIFO head of the waiting queue.
 | `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | Submits a job and returns its JobId. |
 | `runnerctl status <job_id>` | Returns one job's current or terminal state. |
 | `runnerctl list` | Lists all in-memory jobs in JobId order. |
+| `runnerctl cancel <job_id>` | Cancels a `QUEUED` job that has not started. |
 
 The transport is a Unix Domain stream socket. Each message has a 4-byte,
 big-endian payload length followed by at most 64 KiB of payload:
@@ -191,7 +197,7 @@ big-endian payload length followed by at most 64 KiB of payload:
 [ payload length: uint32 big-endian ][ payload bytes ]
 ```
 
-`PING`, `SUBMIT`, `STATUS`, and `LIST` are supported. Invalid requests return
+`PING`, `SUBMIT`, `STATUS`, `LIST`, and `CANCEL` are supported. Invalid requests return
 `ERR <message>`. `FrameDecoder` can assemble a frame across reads and decode
 several frames from one read.
 
@@ -201,12 +207,14 @@ A valid submission receives a JobId and begins in `QUEUED`; after a successful
 launch it becomes `RUNNING`. A child that exits with code `0` reaches
 `SUCCEEDED`; startup failures, non-zero exits, and signal termination result in
 `FAILED`. A resource-creation or registration failure before launch may also
-take a job directly from `QUEUED` to `FAILED`.
+take a job directly from `QUEUED` to `FAILED`; cancelling a job before launch
+takes it from `QUEUED` to `CANCELLED`.
 
 ```text
 QUEUED ──> RUNNING ──> SUCCEEDED
    │          └──────> FAILED
-   └─────────────────> FAILED
+   ├─────────────────> FAILED
+   └─────────────────> CANCELLED
 ```
 
 `status` returns the JobId and state. When available, it also includes the PID,
@@ -221,11 +229,13 @@ Terminal jobs record the number of captured stdout/stderr bytes.
 | `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
 | `STATUS + job_id` | `OK id=<id> state=<state> ...` |
 | `LIST` | `OK`, followed by JobId-sorted job summaries |
+| `CANCEL + job_id` | `OK cancelled` |
 
-SUBMIT integers and argument lengths use unsigned big-endian encoding;
-`timeout_ms = 0` means no timeout is configured. A Unix Domain **stream**
-socket preserves no message boundaries, so both client and daemon use
-`FrameDecoder` to handle fragmented and coalesced frames.
+SUBMIT integers and argument lengths, along with JobIds in STATUS and CANCEL,
+use unsigned big-endian encoding. `timeout_ms = 0` means no timeout is
+configured. A Unix Domain **stream** socket preserves no message boundaries,
+so both client and daemon use `FrameDecoder` to handle fragmented and coalesced
+frames.
 
 ## 🧭 Project Status and Boundaries
 
@@ -238,7 +248,7 @@ limitations are current behavior, not hidden trade-offs:
 | Scheduling | `--max-running` limits concurrent execution; excess jobs remain `QUEUED` in FIFO order, and settlement automatically releases a slot and starts the queue head. |
 | Job data | Job metadata and captured output exist only in memory and are lost after restart. |
 | Output | stdout/stderr are captured, but cannot yet be queried through `runnerctl`; no size limit is applied. |
-| Control | There is no cancellation command. |
+| Control | `QUEUED` jobs can be cancelled; cancellation of running process groups is not implemented, so those requests are rejected. |
 | Security model | The socket is local and mode `0600`, but there is no authentication, container isolation, cgroup, or multi-user authorization. |
 
 Out of scope: remote TCP access, HTTP or Web UI, databases, distributed
@@ -278,12 +288,12 @@ The project requires C++17 and disables compiler extensions. Every target uses
 | Test target | Main coverage |
 | --- | --- |
 | `smoke_test` | Minimal GoogleTest/CTest availability check |
-| `protocol_test` | Framing, SUBMIT/STATUS encoding, and malformed input |
+| `protocol_test` | Framing, SUBMIT/STATUS/CANCEL encoding, and malformed input |
 | `job_test` | Validation, state transitions, and terminal states |
 | `job_scheduler_test` | FIFO order, execution slots, slot release, and queued-job removal |
 | `process_launcher_test` | `fork/execve`, pipes, process groups, and startup failures |
 | `process_monitor_test` | Output capture, settlement, large output, and concurrent reaping |
-| `runnerd_integration_test` | A real daemon, concurrent PING, job queries, bounded concurrency, FIFO advancement, and continued scheduling after failures |
+| `runnerd_integration_test` | A real daemon, job queries, FIFO scheduling, queued cancellation, and failure paths |
 
 ## 📚 Documentation
 
@@ -301,7 +311,8 @@ The project requires C++17 and disables compiler extensions. Every target uses
 - [x] `fork/execve` launch, process groups, output capture, and reaping
 - [x] `STATUS` and `LIST` queries
 - [x] FIFO waiting queue, `--max-running`, terminal slot release, and automatic queue advancement
-- [ ] Enforced timeouts, cancellation, bounded output, and output retrieval
+- [x] `CANCEL` protocol and queued-job cancellation
+- [ ] Running-job cancellation, enforced timeouts, bounded output, and output retrieval
 - [ ] Persistent job history and restart recovery
 - [ ] More failure-path integration tests, Sanitizer checks, and diagnostics
 

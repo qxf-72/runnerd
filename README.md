@@ -38,6 +38,7 @@
 | 可靠分帧 | 长度前缀协议和增量解码正确处理拆包、粘包及二进制 payload。 |
 | 进程监管 | 通过 `fork/execve` 和独立进程组启动任务，全程不经过 shell。 |
 | 有界并发 | `--max-running` 设置运行槽位，超额任务进入 FIFO 等待队列。 |
+| 排队取消 | `runnerctl cancel` 可以安全移除尚未启动的任务，并将其标记为 `CANCELLED`。 |
 | 可观测生命周期 | `signalfd + waitpid` 配合非阻塞 stdout/stderr 管道，驱动有文档说明的任务状态机。 |
 | 可验证行为 | GoogleTest 与 CTest 覆盖协议、状态转移、进程启动、监控和端到端流程。 |
 
@@ -102,6 +103,7 @@ cmake --build build --parallel
 - 客户端断开连接不会取消已提交的任务；任务仍由 daemon 继续监管。
 - daemon 会采集 stdout/stderr，但当前 `runnerctl` 只能查询状态和元数据，不能读取输出正文。
 - 运行任务进入终态后会释放运行槽位，daemon 随即按 FIFO 顺序启动等待队首。
+- `runnerctl cancel <job_id>` 目前只取消仍处于 `QUEUED` 的任务；运行中的任务不会被终止。
 
 ## 🏗️ 架构
 
@@ -127,10 +129,12 @@ flowchart TB
         Route -->|"PING"| Reply
         Route -->|"SUBMIT"| Jobs
         Route -->|"STATUS / LIST"| Jobs
-        Jobs -->|"查询结果"| Reply
+        Route -->|"CANCEL"| Jobs
+        Jobs -->|"处理结果"| Reply
         Reply -->|"写入响应"| Loop
 
         Jobs -->|"加入等待队列"| Scheduler
+        Jobs -->|"取消排队任务"| Scheduler
         Scheduler -->|"取得启动资格"| Monitor --> Launcher
         Pipes -->|"输出 / 启动错误事件"| Loop
         Signal -->|"子进程退出事件"| Loop
@@ -174,6 +178,7 @@ flowchart TB
 | `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | 提交任务并返回 JobId。 |
 | `runnerctl status <job_id>` | 返回单个任务的当前状态或终态。 |
 | `runnerctl list` | 按 JobId 顺序列出全部内存任务。 |
+| `runnerctl cancel <job_id>` | 取消一个尚未启动的 `QUEUED` 任务。 |
 
 底层使用 Unix Domain Stream Socket。每条消息由 4 字节大端 payload 长度和最大
 64 KiB 的 payload 组成：
@@ -182,7 +187,7 @@ flowchart TB
 [ payload length: uint32 big-endian ][ payload bytes ]
 ```
 
-当前支持 `PING`、`SUBMIT`、`STATUS` 和 `LIST`。非法请求会返回
+当前支持 `PING`、`SUBMIT`、`STATUS`、`LIST` 和 `CANCEL`。非法请求会返回
 `ERR <message>`。`FrameDecoder` 能跨多次读取组装单帧，也能从一次读取中解码
 多帧。
 
@@ -191,12 +196,13 @@ flowchart TB
 合法任务会先获得 JobId 并进入 `QUEUED`，启动成功后进入 `RUNNING`。子进程以
 退出码 `0` 退出时任务变为 `SUCCEEDED`；启动失败、非零退出码或被信号终止时则为
 `FAILED`。启动前发生资源创建或注册失败时，任务也可以直接从 `QUEUED` 进入
-`FAILED`。
+`FAILED`；尚未启动的任务被取消时会从 `QUEUED` 进入 `CANCELLED`。
 
 ```text
 QUEUED ──> RUNNING ──> SUCCEEDED
    │          └──────> FAILED
-   └─────────────────> FAILED
+   ├─────────────────> FAILED
+   └─────────────────> CANCELLED
 ```
 
 `status` 会返回 JobId 和状态；在字段可用时，还会包含 PID、超时配置、退出码、
@@ -210,10 +216,11 @@ QUEUED ──> RUNNING ──> SUCCEEDED
 | `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
 | `STATUS + job_id` | `OK id=<id> state=<state> ...` |
 | `LIST` | `OK`，后跟按 JobId 排序的任务摘要 |
+| `CANCEL + job_id` | `OK cancelled` |
 
-`SUBMIT` 中的整数和参数长度均使用大端无符号整数；`timeout_ms = 0` 表示未配置
-超时。Unix Domain **Stream** Socket 不保留消息边界，因此客户端和服务端均通过
-`FrameDecoder` 处理拆包与粘包。
+`SUBMIT` 中的整数和参数长度以及 `STATUS`、`CANCEL` 中的 JobId 均使用大端
+无符号整数；`timeout_ms = 0` 表示未配置超时。Unix Domain **Stream** Socket
+不保留消息边界，因此客户端和服务端均通过 `FrameDecoder` 处理拆包与粘包。
 
 ## 🧭 项目状态与边界
 
@@ -225,7 +232,7 @@ QUEUED ──> RUNNING ──> SUCCEEDED
 | 调度 | `--max-running` 限制并发运行数；超额任务按 FIFO 保持 `QUEUED`，运行任务结算后自动释放槽位并启动队首。 |
 | 任务数据 | 任务元数据和已采集输出仅保存在内存中，daemon 重启后丢失。 |
 | 输出 | stdout/stderr 会被采集，但暂不能通过 `runnerctl` 查询，且未设大小上限。 |
-| 控制 | 尚无取消任务命令。 |
+| 控制 | `QUEUED` 任务可以取消；运行中任务的进程组终止流程尚未实现，因此取消请求会被拒绝。 |
 | 安全模型 | socket 为本地 `0600` 文件，但没有认证、容器隔离、cgroup 或多用户授权。 |
 
 明确不在范围内的能力包括：TCP 远程访问、HTTP 或 Web UI、数据库、分布式 Agent、
@@ -264,12 +271,12 @@ cmake --build build --parallel
 | 测试目标 | 主要覆盖内容 |
 | --- | --- |
 | `smoke_test` | GoogleTest/CTest 最小可用性检查 |
-| `protocol_test` | 分帧、SUBMIT/STATUS 编解码与畸形输入 |
+| `protocol_test` | 分帧、SUBMIT/STATUS/CANCEL 编解码与畸形输入 |
 | `job_test` | 参数校验、状态转移和终态 |
 | `job_scheduler_test` | FIFO 顺序、并发槽位、槽位释放和排队任务移除 |
 | `process_launcher_test` | `fork/execve`、管道、进程组和启动失败 |
 | `process_monitor_test` | 输出采集、结算、大输出和并发回收 |
-| `runnerd_integration_test` | 真实 daemon、并发 PING、任务查询、最大并发、FIFO 自动推进及失败后继续调度 |
+| `runnerd_integration_test` | 真实 daemon、任务查询、FIFO 调度、排队取消及失败路径 |
 
 ## 📚 文档
 
@@ -287,7 +294,8 @@ cmake --build build --parallel
 - [x] `fork/execve` 启动、进程组、输出采集和回收
 - [x] `STATUS` 与 `LIST` 查询
 - [x] FIFO 等待队列、`--max-running`、终态槽位释放与队列自动推进
-- [ ] 强制超时、取消任务、有界输出和输出查询
+- [x] `CANCEL` 协议与排队任务取消
+- [ ] 运行中任务取消、强制超时、有界输出和输出查询
 - [ ] 任务历史持久化与重启恢复
 - [ ] 更多失败路径的集成测试、Sanitizer 检查和诊断报告
 

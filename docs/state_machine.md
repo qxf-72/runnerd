@@ -4,7 +4,8 @@
 单元测试已经实现，并已接入 SUBMIT 流程：每个合法提交都会创建一个初始
 状态为 `QUEUED` 的任务并加入 `JobScheduler`。获得运行槽位的任务由
 `ProcessMonitor` 启动，并根据子进程结果迁移到 `RUNNING`、`SUCCEEDED`
-或 `FAILED`；没有空闲槽位的任务继续保持 `QUEUED`。
+或 `FAILED`；没有空闲槽位的任务继续保持 `QUEUED`，并可以通过 `CANCEL`
+请求从等待队列移除后进入 `CANCELLED`。
 
 ## 状态说明
 
@@ -77,8 +78,8 @@ TERMINATING -> INTERRUPTED
   `std::invalid_argument`。当前还要求 `argv[0]` 必须是绝对路径。
 
 `transitionJob` 只负责校验并更新 `Job::state`。`ProcessMonitor` 负责填写
-PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取消与超时功能
-接入后再填写终止原因。
+PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排队取消不会启动
+进程，也不经过 `ProcessMonitor`；运行中取消与超时接入后再填写终止原因。
 
 ## 当前运行时行为
 
@@ -89,6 +90,11 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息；取�
 - 运行任务最终结算后，`ProcessMonitor` 会通知 daemon 释放运行槽位；daemon
   随后继续调度，按 FIFO 顺序启动下一个等待任务。
 - 如果任务在同步启动阶段失败，daemon 会立即释放槽位并继续调度后续任务。
+- `runnerctl cancel <job_id>` 可以把 `QUEUED` 任务从 FIFO 等待队列移除，
+  再执行 `QUEUED -> CANCELLED`；取消队列中间任务不会改变其他任务的顺序。
+- 不存在、已进入终态或正在终止的任务不能取消；重复取消会返回错误。
+- `RUNNING` 任务的取消目前会被明确拒绝，不发送信号，也不会进入
+  `TERMINATING`。运行中取消和超时终止流程尚未实现。
 - 客户端断开后任务仍然执行并保留。
 - 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
   退出、信号终止或启动失败时进入 `FAILED`。
@@ -114,9 +120,14 @@ execve 失败、非零退出、大输出排空和多个子进程同时回收。
 `tests/job_scheduler_test.cpp` 覆盖非法最大并发数、FIFO 启动顺序、并发槽位、
 终态任务释放槽位、排队任务移除和重复调度保护。
 
+`tests/protocol_test.cpp` 覆盖 CANCEL 的 8 字节大端 JobId 往返，以及零 JobId、
+错误前缀、截断和尾随字节等畸形请求。
+
 `tests/runnerd_integration_test.cpp` 通过真实 daemon 和 runnerctl 覆盖成功
 任务与失败任务的 STATUS 查询、非零退出码、stdout/stderr 字节数、LIST
 顺序、不存在的 JobId、非法 STATUS/LIST 参数，以及 `--max-running` 为 `1`
 或 `2` 时的并发限制和非法并发参数。还覆盖成功退出、非零退出及 `execve`
 失败后的队列自动推进、FIFO 启动顺序，以及多个任务快速退出时槽位不会泄漏
-或重复释放。
+或重复释放。CANCEL 测试还覆盖命令行参数校验、排队任务取消、STATUS/LIST
+中的 `CANCELLED`、取消队列中间任务后的 FIFO 推进，以及不存在、运行中、
+已终态和重复取消的错误响应。
