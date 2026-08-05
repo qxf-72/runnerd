@@ -4,6 +4,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 
@@ -30,7 +31,19 @@ class ProcessMonitor {
   // 处理 stdout、stderr、startup error pipe 或 signalfd 事件。
   void handleFileDescriptorEvent(int fd, std::uint32_t event_mask);
 
+  using TerminalJobCallback = std::function<void(JobId)>;
+
+  // 只能在尚未启动任何任务时设置一次。
+  //
+  // 注意：
+  // - launchProcess() 等同步启动失败不会触发这个回调；
+  //   调用 startJob() 的 daemon 会立即观察到 FAILED，并自行释放槽位。
+  // - 已经启动的任务在 SIGCHLD / pipe EOF 后最终结算时，
+  //   才会触发这个回调。
+  void setTerminalJobCallback(TerminalJobCallback callback);
+
  private:
+  TerminalJobCallback terminal_job_callback_;
   enum class ProcessFdKind {
     kStdout,
     kStderr,

@@ -154,6 +154,26 @@ bool ProcessMonitor::ownsFileDescriptor(int fd) const {
   return fd == sigchld_fd_ || tracked_fds_.find(fd) != tracked_fds_.end();
 }
 
+void ProcessMonitor::setTerminalJobCallback(TerminalJobCallback callback) {
+  if (!callback) {
+    throw std::invalid_argument("terminal job callback must not be empty");
+  }
+
+  // 回调代表 ProcessMonitor 与 daemon 的协作关系。
+  // 运行中替换它，会让不同任务的终态通知去向不一致，
+  // 因此只允许在尚未启动任何任务时设置。
+  if (!active_jobs_.empty()) {
+    throw std::logic_error("terminal job callback must be set before starting jobs");
+  }
+
+  // 重复设置通常意味着 daemon 的初始化顺序有问题。
+  if (terminal_job_callback_) {
+    throw std::logic_error("terminal job callback is already set");
+  }
+
+  terminal_job_callback_ = std::move(callback);
+}
+
 void ProcessMonitor::failQueuedJob(Job& job, const std::string& message) {
   transitionJob(job, JobState::kFailed);
   job.failure_message = message;
@@ -485,8 +505,24 @@ void ProcessMonitor::tryFinalizeJob(JobId job_id) {
             << " bytes, stderr=" << job.standard_error.size() << " bytes\n"
             << std::flush;
 
-  pid_to_job_.erase(process.pid);
+  const pid_t child_pid = process.pid;
+  const JobId finalized_job_id = job.id;
+
+  // 到这里，Job 已经完成：
+  //
+  // - child_exited 为 true；
+  // - stdout / stderr / startup-error 都已 EOF；
+  // - Job 已进入某个终态；
+  // - 输出已经从 ActiveProcess 转移到 Job。
+  //
+
+  pid_to_job_.erase(child_pid);
   active_jobs_.erase(active_it);
+
+  if (terminal_job_callback_) {
+    terminal_job_callback_(finalized_job_id);
+  }
+
 }
 
 void ProcessMonitor::handleFileDescriptorEvent(int fd, std::uint32_t event_mask) {

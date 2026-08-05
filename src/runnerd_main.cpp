@@ -7,6 +7,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -195,6 +196,38 @@ void pumpScheduler(Jobs& jobs, runnerd::JobScheduler& scheduler,
       // 要么 RUNNING；出现第三种状态说明模块之间的约定被破坏。
       throw std::logic_error("started job is neither RUNNING nor terminal");
     }
+  }
+}
+
+// ProcessMonitor 只负责把“任务已经终态”这一事实通知给 daemon。
+// daemon 把通知暂存在队列中，离开 ProcessMonitor 的调用栈后再处理。
+using TerminalJobNotifications = std::deque<runnerd::JobId>;
+
+// 处理所有已经收到的终态通知。
+void processTerminalJobNotifications(Jobs& jobs, runnerd::JobScheduler& scheduler,
+                                     runnerd::ProcessMonitor& process_monitor,
+                                     TerminalJobNotifications& notifications) {
+  while (!notifications.empty()) {
+    const runnerd::JobId job_id = notifications.front();
+    notifications.pop_front();
+
+    const auto job_it = jobs.find(job_id);
+
+    if (job_it == jobs.end()) {
+      // ProcessMonitor 上报的 Job 必须仍属于 daemon 的 JobTable。
+      throw std::logic_error("terminal notification refers to an unknown job");
+    }
+
+    if (!runnerd::isTerminal(job_it->second.state)) {
+      // 回调语义是“已经终态”，不是“收到了 SIGCHLD”。
+      // 如果仍是 RUNNING，说明 ProcessMonitor 的时序被破坏。
+      throw std::logic_error("terminal notification refers to a non-terminal job");
+    }
+
+    scheduler.onJobReachedTerminalState(job_id);
+
+    // 归还槽位后，立即尝试启动 FIFO 队列的后续任务。
+    pumpScheduler(jobs, scheduler, process_monitor);
   }
 }
 
@@ -546,17 +579,22 @@ int main(int argc, char* argv[]) {
 
     Connections connections;
 
-    // 任务表与 daemon 生命周期相同。
-    // 客户端断开时不能删除任务。
     Jobs jobs;
 
-    // ProcessMonitor 必须在启动任何 Job 前构造，
-    // 因为构造函数会屏蔽 SIGCHLD 并创建 signalfd。
+    // Scheduler 比 ProcessMonitor 先构造。
+    // 析构时顺序相反：ProcessMonitor 会先销毁，
+    // 其内部保存的回调不会访问已经销毁的 Scheduler。
+    runnerd::JobScheduler scheduler(options.max_running);
+
+    // 回调只向这个队列追加 JobId。
+    // 它不直接释放槽位，也不直接启动下一项任务。
+    TerminalJobNotifications terminal_job_notifications;
+
     runnerd::ProcessMonitor process_monitor(epoll_fd, jobs);
 
-    // Scheduler 不持有 JobTable，也不持有 ProcessMonitor。
-    // daemon 只是把两个独立模块放在同一个事件循环中协作。
-    runnerd::JobScheduler scheduler(options.max_running);
+    process_monitor.setTerminalJobCallback([&terminal_job_notifications](runnerd::JobId job_id) {
+      terminal_job_notifications.push_back(job_id);
+    });
 
     runnerd::JobId next_job_id = 1;
 
@@ -593,6 +631,14 @@ int main(int argc, char* argv[]) {
 
         if (process_monitor.ownsFileDescriptor(fd)) {
           process_monitor.handleFileDescriptorEvent(fd, event_mask);
+
+          // handleFileDescriptorEvent() 可能刚刚让一个或多个任务进入终态，
+          // ProcessMonitor 的回调会把 JobId 放入 terminal_job_notifications。
+          //
+          // 现在已经离开 ProcessMonitor 的内部结算逻辑，
+          // 可以安全释放槽位并启动下一个 FIFO 任务。
+          processTerminalJobNotifications(jobs, scheduler, process_monitor,
+                                          terminal_job_notifications);
           continue;
         }
 
