@@ -132,12 +132,10 @@ bool parseCommandLine(int argc, char* argv[], DaemonOptions& options, std::strin
   return true;
 }
 
-// 连接状态
+// 连接状态管理
 struct Connection {
-  // 每个连接独立保存解码器，使不完整帧可以跨多次 epoll 事件继续接收。
   runnerd::FrameDecoder decoder;
 
-  // 尚未发送完的响应，以及下一次 write 应该开始的位置。
   std::vector<char> write_buffer;
   std::size_t write_offset = 0;
 
@@ -147,21 +145,15 @@ struct Connection {
 
 using Connections = std::unordered_map<int, Connection>;
 
-// 任务属于 daemon，而不是某一条客户端连接。
+// In namespace runnerd
+// using JobTable = std::unordered_map<JobId, Job>
 using Jobs = runnerd::JobTable;
 
-// 尽可能多地启动等待任务，直到：
-// 1. 等待队列为空；或
-// 2. 所有运行槽位都已被预留。
-//
-// 注意：这个函数只负责把 Scheduler 和 ProcessMonitor 串起来。
-// JobScheduler 不知道进程，ProcessMonitor 也不知道 FIFO 策略。
+// 尽可能多地启动等待任务
 void pumpScheduler(Jobs& jobs, runnerd::JobScheduler& scheduler,
                    runnerd::ProcessMonitor& process_monitor) {
   for (;;) {
-    // takeNextJobToStart() 成功时，Scheduler 已经为该任务预留了一个槽位。
     const std::optional<runnerd::JobId> next_job_id = scheduler.takeNextJobToStart();
-
     if (!next_job_id.has_value()) {
       // 没有等待任务，或者没有空闲槽位。
       return;
@@ -182,8 +174,6 @@ void pumpScheduler(Jobs& jobs, runnerd::JobScheduler& scheduler,
     const runnerd::Job& job = jobs.at(job_id);
 
     if (runnerd::isTerminal(job.state)) {
-      // 此任务在 startJob() 内同步失败，已经不会再收到后续的
-      // SIGCHLD / pipe / EOF 事件，因此必须立刻归还刚才预留的槽位。
       scheduler.onJobReachedTerminalState(job_id);
 
       // 归还槽位后，可能可以立刻启动队列中的下一个任务。
@@ -406,7 +396,8 @@ std::string makeListResponse(const Jobs& jobs) {
 }
 
 // 取消一个任务。
-std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& scheduler) {
+std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& scheduler,
+                      runnerd::ProcessMonitor& process_monitor) {
   const auto job_it = jobs.find(job_id);
 
   if (job_it == jobs.end()) {
@@ -419,8 +410,6 @@ std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& 
     // 先从 Scheduler 移除，再修改 JobState。
     // 这样不会留下“状态是 CANCELLED，却仍在 FIFO 队列中”的任务。
     if (!scheduler.cancelQueuedJob(job_id)) {
-      // Job 表示自己是 QUEUED，但 Scheduler 找不到它，
-      // 说明 daemon 内部的两个数据结构失去一致性。
       throw std::logic_error("queued job is missing from scheduler");
     }
 
@@ -433,16 +422,23 @@ std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& 
   }
 
   if (job.state == runnerd::JobState::kRunning) {
-    // 以后才会实现：
-    //
-    // RUNNING -> TERMINATING
-    // kill(-process_group_id, SIGTERM)
-    // 继续 drain stdout/stderr
-    // 最终 TERMINATING -> CANCELLED
-    //
-    // 今天绝对不能假装已经取消成功，
-    // 因为此时子进程仍会继续运行。
-    return "ERR running job cancellation is not available yet";
+    try {
+      const bool requested =
+          process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kCancelled);
+
+      if (!requested) {
+        // 进程组已经不存在，但 SIGCHLD 可能尚未被事件循环处理。
+        // 此时不能擅自把任务标记 CANCELLED。
+        return "ERR job process already exited; retry status";
+      }
+      return "OK terminating";
+    } catch (const std::system_error& exception) {
+      // 保持 Job 为 RUNNING，不改变 termination_cause，
+      // 让客户端获得可读错误，而不是关闭连接或让 daemon 崩溃。
+      std::cerr << "failed to terminate job " << job_id << ": " << exception.what() << '\n';
+
+      return std::string("ERR failed to send SIGTERM: ") + exception.code().message();
+    }
   }
 
   if (job.state == runnerd::JobState::kTerminating) {
@@ -490,7 +486,7 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
     try {
       const runnerd::JobId job_id = runnerd::decodeCancelRequest(request);
 
-      return cancelJob(job_id, jobs, scheduler);
+      return cancelJob(job_id, jobs, scheduler, process_monitor);
     } catch (const std::invalid_argument& exception) {
       // 客户端发送的是 CANCEL 前缀，但二进制结构不合法。
       // 这属于普通协议错误，不应该让 daemon 退出。

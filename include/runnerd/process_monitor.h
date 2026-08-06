@@ -26,6 +26,9 @@ class ProcessMonitor {
   // 启动失败会把 Job 标记为 FAILED，而不是让 daemon 退出。
   void startJob(JobId job_id);
 
+  // 请求终止一个正在运行的任务。
+  bool requestTerminate(JobId job_id, TerminationCause cause);
+
   bool ownsFileDescriptor(int fd) const;
 
   // 处理 stdout、stderr、startup error pipe 或 signalfd 事件。

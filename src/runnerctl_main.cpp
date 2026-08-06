@@ -439,13 +439,24 @@ bool handleResponse(const CommandLine& command_line, const std::string& response
       return true;
 
     case Command::kCancel:
-      if (response != "OK cancelled") {
-        std::cerr << "unexpected response: " << response << '\n';
-        return false;
-      }
-      std::cout << "Cancelled job " << command_line.job_id << '\n';
+      if (response == "OK cancelled") {
+        // 排队任务直接进入终态。
+        std::cout << "Cancelled job " << command_line.job_id << '\n';
 
-      return true;
+        return true;
+      }
+
+      if (response == "OK terminating") {
+        // 运行中任务只是完成了“请求终止”。
+        // 最终状态仍需通过 status 查询。
+        std::cout << "Cancellation requested for job " << command_line.job_id << '\n';
+
+        return true;
+      }
+
+      std::cerr << "unexpected response: " << response << '\n';
+
+      return false;
   }
 
   return false;

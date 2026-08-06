@@ -1,5 +1,6 @@
 #include "runnerd/process_monitor.h"
 
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/wait.h>
@@ -289,6 +290,61 @@ void ProcessMonitor::startJob(JobId job_id) {
   std::cout << "started job " << job_id << " with pid " << process.pid << '\n';
 }
 
+bool ProcessMonitor::requestTerminate(JobId job_id, TerminationCause cause) {
+  Job& job = jobs_.at(job_id);
+
+  if (job.state != JobState::kRunning) {
+    throw std::logic_error("only RUNNING jobs can be terminated");
+  }
+
+  const auto active_it = active_jobs_.find(job_id);
+
+  if (active_it == active_jobs_.end()) {
+    throw std::logic_error("running job has no active process");
+  }
+
+  ActiveProcess& process = active_it->second;
+
+  if (process.process_group_id <= 0) {
+    throw std::logic_error("running job has an invalid process group id");
+  }
+
+  //   kill(-pgid, SIGTERM)
+  //       → 向整个进程组发送 SIGTERM
+  //
+  // 这样 /bin/sh 创建的后台子进程、孙进程也会一起收到信号。
+  for (;;) {
+    if (::kill(-process.process_group_id, SIGTERM) == 0) {
+      break;
+    }
+
+    const int error_number = errno;
+
+    if (error_number == EINTR) {
+      continue;
+    }
+
+    if (error_number == ESRCH) {
+      // 子进程可能已经自然退出，只是 SIGCHLD 尚未在事件循环中处理。
+      //
+      // 不允许此时擅自把 Job 改成 CANCELLED；
+      // 后续 waitpid 会根据真实退出结果结算。
+      return false;
+    }
+
+    throw std::system_error(error_number, std::generic_category(),
+                            "send SIGTERM to job process group");
+  }
+
+  transitionJob(job, JobState::kTerminating);
+  job.termination_cause = cause;
+
+  std::cout << "requested termination of job " << job_id << " for process group "
+            << process.process_group_id << '\n';
+
+  return true;
+}
+
 void ProcessMonitor::closeTrackedFd(int fd) {
   const auto tracked_it = tracked_fds_.find(fd);
 
@@ -469,7 +525,35 @@ void ProcessMonitor::tryFinalizeJob(JobId job_id) {
   job.standard_output.swap(process.standard_output);
   job.standard_error.swap(process.standard_error);
 
-  if (process.startup_error_bytes.empty()) {
+  // TERMINATING 状态拥有更高优先级。
+  if (job.state == JobState::kTerminating) {
+    if (!job.termination_cause.has_value()) {
+      throw std::logic_error("terminating job has no termination cause");
+    }
+
+    // 仍然保留真实 waitpid 结果。
+    if (WIFEXITED(process.wait_status)) {
+      job.exit_code = WEXITSTATUS(process.wait_status);
+    } else if (WIFSIGNALED(process.wait_status)) {
+      job.exit_signal = WTERMSIG(process.wait_status);
+    } else {
+      throw std::logic_error("terminating job has unexpected waitpid status");
+    }
+
+    switch (*job.termination_cause) {
+      case TerminationCause::kCancelled:
+        transitionJob(job, JobState::kCancelled);
+        break;
+
+      case TerminationCause::kTimedOut:
+        // Day 6 才会真正使用这个分支。
+        // 现在先保持状态机的完整性。
+        transitionJob(job, JobState::kTimedOut);
+        break;
+    }
+  } else if (process.startup_error_bytes.empty()) {
+    // 没有收到 execve / 子进程初始化错误，
+    // 按普通任务的退出码或信号结算。
     if (WIFEXITED(process.wait_status)) {
       job.exit_code = WEXITSTATUS(process.wait_status);
 
@@ -477,21 +561,27 @@ void ProcessMonitor::tryFinalizeJob(JobId job_id) {
         transitionJob(job, JobState::kSucceeded);
       } else {
         transitionJob(job, JobState::kFailed);
+
         job.failure_message = "process exited with code " + std::to_string(*job.exit_code);
       }
     } else if (WIFSIGNALED(process.wait_status)) {
       job.exit_signal = WTERMSIG(process.wait_status);
+
       transitionJob(job, JobState::kFailed);
+
       job.failure_message = "process terminated by signal " + std::to_string(*job.exit_signal);
     } else {
       transitionJob(job, JobState::kFailed);
+
       job.failure_message = "unexpected waitpid status";
     }
   } else if (process.startup_error_bytes.size() == sizeof(ChildStartupError)) {
     ChildStartupError startup_error{};
+
     std::memcpy(&startup_error, process.startup_error_bytes.data(), sizeof(startup_error));
 
     transitionJob(job, JobState::kFailed);
+
     job.failure_message = std::string("child startup failed at ") +
                           startupStageName(startup_error.stage) + ": " +
                           std::strerror(startup_error.error_number);
@@ -522,7 +612,6 @@ void ProcessMonitor::tryFinalizeJob(JobId job_id) {
   if (terminal_job_callback_) {
     terminal_job_callback_(finalized_job_id);
   }
-
 }
 
 void ProcessMonitor::handleFileDescriptorEvent(int fd, std::uint32_t event_mask) {
