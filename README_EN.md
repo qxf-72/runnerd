@@ -40,7 +40,7 @@ purpose scheduler or remote execution platform.
 | Reliable framing | A length-prefixed protocol with incremental decoding handles partial, coalesced, and binary payloads. |
 | Process supervision | Jobs use `fork/execve` and a separate process group; no shell is involved. |
 | Bounded concurrency | `--max-running` configures execution slots; excess jobs enter a FIFO waiting queue. |
-| Queued cancellation | `runnerctl cancel` safely removes jobs that have not started and marks them `CANCELLED`. |
+| Job cancellation | Queued jobs are removed directly; running jobs receive process-group `SIGTERM` and settle after their output is drained. |
 | Observable lifecycle | `signalfd + waitpid` and non-blocking stdout/stderr pipes drive a documented job state machine. |
 | Tested behavior | GoogleTest and CTest cover protocol, state transitions, process launch, monitoring, and end-to-end flows. |
 
@@ -86,6 +86,7 @@ Use a second terminal to check the connection, submit a job, and inspect it:
 
 ./build/runnerctl status 1
 ./build/runnerctl list
+./build/runnerctl cancel 1
 ```
 
 The default socket path is `/tmp/runnerd.sock`. To use a different path, pass
@@ -109,8 +110,11 @@ the job's `argv`. The executable (`argv[0]`) must be an absolute path.
   metadata only, not the output content.
 - When a running job reaches a terminal state, its execution slot is released and
   the daemon immediately starts the FIFO head of the waiting queue.
-- `runnerctl cancel <job_id>` currently cancels only jobs that are still `QUEUED`;
-  it does not terminate running jobs.
+- `runnerctl cancel <job_id>` directly cancels `QUEUED` jobs. For `RUNNING`
+  jobs, the daemon sends `SIGTERM` to the entire process group and marks the job
+  `CANCELLED` after the child exits and all output is drained.
+- There is no grace-period `SIGKILL` escalation yet; a job that ignores
+  `SIGTERM` remains `TERMINATING`.
 
 ## 🏗️ Architecture
 
@@ -142,6 +146,7 @@ flowchart TB
 
         Jobs -->|"enqueue"| Scheduler
         Jobs -->|"cancel queued job"| Scheduler
+        Jobs -->|"terminate running job"| Monitor
         Scheduler -->|"grant start slot"| Monitor --> Launcher
         Pipes -->|"output / startup-error event"| Loop
         Signal -->|"child-exit event"| Loop
@@ -164,6 +169,9 @@ table. A client disconnect does not terminate a submitted job. A job is settled
 only after its child has exited and every monitored pipe reaches EOF.
 `ProcessMonitor` then notifies the daemon to release the execution slot, after
 which the daemon starts the FIFO head of the waiting queue.
+To cancel a running job, `ProcessMonitor` sends `SIGTERM` to the negative
+process-group ID, continues draining stdout/stderr, and finally settles the job
+from `TERMINATING` to `CANCELLED` according to its termination cause.
 
 ## 🧩 Project Structure
 
@@ -188,7 +196,7 @@ which the daemon starts the FIFO head of the waiting queue.
 | `runnerctl submit [--timeout <ms>] -- <absolute-path> [args...]` | Submits a job and returns its JobId. |
 | `runnerctl status <job_id>` | Returns one job's current or terminal state. |
 | `runnerctl list` | Lists all in-memory jobs in JobId order. |
-| `runnerctl cancel <job_id>` | Cancels a `QUEUED` job that has not started. |
+| `runnerctl cancel <job_id>` | Cancels a `QUEUED` job or requests termination of a `RUNNING` job's process group. |
 
 The transport is a Unix Domain stream socket. Each message has a 4-byte,
 big-endian payload length followed by at most 64 KiB of payload:
@@ -208,11 +216,13 @@ launch it becomes `RUNNING`. A child that exits with code `0` reaches
 `SUCCEEDED`; startup failures, non-zero exits, and signal termination result in
 `FAILED`. A resource-creation or registration failure before launch may also
 take a job directly from `QUEUED` to `FAILED`; cancelling a job before launch
-takes it from `QUEUED` to `CANCELLED`.
+takes it from `QUEUED` to `CANCELLED`. Cancelling a running job first moves it
+to `TERMINATING`; it reaches `CANCELLED` after process exit and output drain.
 
 ```text
 QUEUED ──> RUNNING ──> SUCCEEDED
-   │          └──────> FAILED
+   │          ├──────> FAILED
+   │          └──────> TERMINATING ──> CANCELLED
    ├─────────────────> FAILED
    └─────────────────> CANCELLED
 ```
@@ -229,7 +239,7 @@ Terminal jobs record the number of captured stdout/stderr bytes.
 | `SUBMIT + timeout_ms + argc + argv` | `OK <job_id>` |
 | `STATUS + job_id` | `OK id=<id> state=<state> ...` |
 | `LIST` | `OK`, followed by JobId-sorted job summaries |
-| `CANCEL + job_id` | `OK cancelled` |
+| `CANCEL + job_id` | `OK cancelled` for queued jobs; `OK terminating` for running jobs |
 
 SUBMIT integers and argument lengths, along with JobIds in STATUS and CANCEL,
 use unsigned big-endian encoding. `timeout_ms = 0` means no timeout is
@@ -248,7 +258,7 @@ limitations are current behavior, not hidden trade-offs:
 | Scheduling | `--max-running` limits concurrent execution; excess jobs remain `QUEUED` in FIFO order, and settlement automatically releases a slot and starts the queue head. |
 | Job data | Job metadata and captured output exist only in memory and are lost after restart. |
 | Output | stdout/stderr are captured, but cannot yet be queried through `runnerctl`; no size limit is applied. |
-| Control | `QUEUED` jobs can be cancelled; cancellation of running process groups is not implemented, so those requests are rejected. |
+| Control | `QUEUED` jobs are cancelled directly; `RUNNING` jobs enter `TERMINATING` through process-group `SIGTERM` and become `CANCELLED` after output drain. There is no `SIGKILL` escalation yet, so signal-ignoring jobs remain `TERMINATING`. |
 | Security model | The socket is local and mode `0600`, but there is no authentication, container isolation, cgroup, or multi-user authorization. |
 
 Out of scope: remote TCP access, HTTP or Web UI, databases, distributed
@@ -292,8 +302,8 @@ The project requires C++17 and disables compiler extensions. Every target uses
 | `job_test` | Validation, state transitions, and terminal states |
 | `job_scheduler_test` | FIFO order, execution slots, slot release, and queued-job removal |
 | `process_launcher_test` | `fork/execve`, pipes, process groups, and startup failures |
-| `process_monitor_test` | Output capture, settlement, large output, and concurrent reaping |
-| `runnerd_integration_test` | A real daemon, job queries, FIFO scheduling, queued cancellation, and failure paths |
+| `process_monitor_test` | Output capture, settlement, large output, concurrent reaping, and post-cancel output drain |
+| `runnerd_integration_test` | A real daemon, FIFO scheduling, queued and running cancellation, process-group termination, and failure paths |
 
 ## 📚 Documentation
 
@@ -311,8 +321,8 @@ The project requires C++17 and disables compiler extensions. Every target uses
 - [x] `fork/execve` launch, process groups, output capture, and reaping
 - [x] `STATUS` and `LIST` queries
 - [x] FIFO waiting queue, `--max-running`, terminal slot release, and automatic queue advancement
-- [x] `CANCEL` protocol and queued-job cancellation
-- [ ] Running-job cancellation, enforced timeouts, bounded output, and output retrieval
+- [x] `CANCEL` protocol, queued cancellation, and process-group `SIGTERM` for running jobs
+- [ ] Forced `SIGKILL` escalation, enforced timeouts, bounded output, and output retrieval
 - [ ] Persistent job history and restart recovery
 - [ ] More failure-path integration tests, Sanitizer checks, and diagnostics
 
