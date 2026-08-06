@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,56 @@
 #include <vector>
 
 namespace {
+
+class TemporaryPath {
+ public:
+  TemporaryPath() {
+    char path_template[] = "/tmp/runnerd-process-monitor.XXXXXX";
+    const int fd = ::mkstemp(path_template);
+
+    if (fd == -1) {
+      throw std::system_error(errno, std::generic_category(), "mkstemp");
+    }
+
+    path_ = path_template;
+    static_cast<void>(::close(fd));
+
+    // 测试任务会在完成初始化后重新创建这个文件，父进程据此避免过早发送 SIGTERM。
+    if (::unlink(path_.c_str()) == -1) {
+      throw std::system_error(errno, std::generic_category(), "unlink temporary marker");
+    }
+  }
+
+  TemporaryPath(const TemporaryPath&) = delete;
+  TemporaryPath& operator=(const TemporaryPath&) = delete;
+
+  ~TemporaryPath() {
+    static_cast<void>(::unlink(path_.c_str()));
+  }
+
+  const std::string& get() const noexcept {
+    return path_;
+  }
+
+ private:
+  std::string path_;
+};
+
+bool waitForPath(const std::string& path) {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    if (::access(path.c_str(), F_OK) == 0) {
+      return true;
+    }
+
+    if (errno != ENOENT) {
+      throw std::system_error(errno, std::generic_category(), "access temporary marker");
+    }
+
+    ::usleep(10'000);
+  }
+
+  return false;
+}
 
 class ProcessMonitorHarness {
  public:
@@ -60,6 +111,10 @@ class ProcessMonitorHarness {
 
   void startJob(runnerd::JobId job_id) {
     monitor_->startJob(job_id);
+  }
+
+  bool requestTerminate(runnerd::JobId job_id, runnerd::TerminationCause cause) {
+    return monitor_->requestTerminate(job_id, cause);
   }
 
   const runnerd::Job& job(runnerd::JobId job_id) const {
@@ -236,6 +291,45 @@ TEST(ProcessMonitorTest, MarksInvalidQueuedJobAsFailed) {
   EXPECT_EQ(job.state, runnerd::JobState::kFailed);
   EXPECT_NE(job.failure_message.find("launchProcess failed"), std::string::npos);
   EXPECT_FALSE(job.pid.has_value());
+}
+
+TEST(ProcessMonitorTest, CancelsRunningJobAfterDrainingRemainingOutput) {
+  ProcessMonitorHarness harness;
+  TemporaryPath ready_marker;
+
+  // 先安装 SIGTERM handler 并写出初始输出，再创建 marker 通知测试线程。
+  // handler 会在收到取消信号后补写尾部输出，验证 ProcessMonitor 没有提前关 pipe。
+  harness.addJob(1, {
+                        "/bin/sh",
+                        "-c",
+                        "trap 'printf tail; printf errtail >&2; exit 0' TERM; "
+                        "printf head; printf errhead >&2; : > \"$1\"; "
+                        "while :; do sleep 30; done",
+                        "runnerd-process-monitor-test",
+                        ready_marker.get(),
+                    });
+
+  harness.startJob(1);
+  ASSERT_TRUE(waitForPath(ready_marker.get()));
+
+  EXPECT_TRUE(harness.requestTerminate(1, runnerd::TerminationCause::kCancelled));
+
+  const runnerd::Job& terminating_job = harness.job(1);
+  EXPECT_EQ(terminating_job.state, runnerd::JobState::kTerminating);
+  ASSERT_TRUE(terminating_job.termination_cause.has_value());
+  EXPECT_EQ(*terminating_job.termination_cause, runnerd::TerminationCause::kCancelled);
+
+  harness.waitForJob(1);
+
+  const runnerd::Job& cancelled_job = harness.job(1);
+  EXPECT_EQ(cancelled_job.state, runnerd::JobState::kCancelled);
+  ASSERT_TRUE(cancelled_job.exit_code.has_value());
+  EXPECT_EQ(*cancelled_job.exit_code, 0);
+  EXPECT_FALSE(cancelled_job.exit_signal.has_value());
+  EXPECT_EQ(cancelled_job.standard_output, "headtail");
+  EXPECT_NE(cancelled_job.standard_error.find("errhead"), std::string::npos);
+  EXPECT_NE(cancelled_job.standard_error.find("errtail"), std::string::npos);
+  EXPECT_TRUE(cancelled_job.failure_message.empty());
 }
 
 }  // namespace

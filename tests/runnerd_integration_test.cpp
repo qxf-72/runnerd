@@ -76,6 +76,39 @@ void waitWithoutThrow(pid_t pid) {
   }
 }
 
+pid_t waitForPidFile(const std::string& path) {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    std::ifstream input(path);
+    pid_t pid = -1;
+
+    if (input >> pid && pid > 0) {
+      return pid;
+    }
+
+    ::usleep(10'000);
+  }
+
+  return -1;
+}
+
+bool waitForProcessToDisappear(pid_t pid) {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    if (::kill(pid, 0) == -1) {
+      if (errno == ESRCH) {
+        return true;
+      }
+
+      if (errno != EINTR) {
+        throw std::system_error(errno, std::generic_category(), "check descendant process");
+      }
+    }
+
+    ::usleep(10'000);
+  }
+
+  return false;
+}
+
 class ChildProcess {
  public:
   ChildProcess() = default;
@@ -268,6 +301,10 @@ class RunnerdIntegrationTest : public ::testing::Test {
       static_cast<void>(::unlink(server_log_path_.c_str()));
     }
 
+    for (const std::string& path : temporary_file_paths_) {
+      static_cast<void>(::unlink(path.c_str()));
+    }
+
     if (!test_directory_.empty()) {
       static_cast<void>(::rmdir(test_directory_.c_str()));
     }
@@ -311,6 +348,12 @@ class RunnerdIntegrationTest : public ::testing::Test {
     return status;
   }
 
+  std::string makeTemporaryFilePath(const std::string& filename) {
+    const std::string path = test_directory_ + "/" + filename;
+    temporary_file_paths_.push_back(path);
+    return path;
+  }
+
   bool serverIsRunning() const {
     return server_pid_ > 0 && ::kill(server_pid_, 0) == 0;
   }
@@ -350,6 +393,7 @@ class RunnerdIntegrationTest : public ::testing::Test {
   std::string test_directory_;
   std::string socket_path_;
   std::string server_log_path_;
+  std::vector<std::string> temporary_file_paths_;
   pid_t server_pid_ = -1;
 };
 
@@ -629,7 +673,7 @@ TEST_F(RunnerdIntegrationTest, CancellingMiddleQueuedJobPreservesFifoProgress) {
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
-TEST_F(RunnerdIntegrationTest, RejectsMissingRunningTerminalAndRepeatedCancellation) {
+TEST_F(RunnerdIntegrationTest, RejectsMissingTerminalTerminatingAndRepeatedCancellation) {
   const ChildResult missing = runClient({"cancel", "999"});
   EXPECT_NE(missing.exit_code, 0);
   EXPECT_NE(missing.standard_error.find("job not found"), std::string::npos);
@@ -645,15 +689,28 @@ TEST_F(RunnerdIntegrationTest, RejectsMissingRunningTerminalAndRepeatedCancellat
   EXPECT_NE(terminal.exit_code, 0);
   EXPECT_NE(terminal.standard_error.find("already terminal"), std::string::npos);
 
-  const ChildResult running_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+  // 让 Job 2 明确忽略 SIGTERM，稳定停留在 TERMINATING，便于验证重复取消。
+  const std::string ready_file = makeTemporaryFilePath("ignores-sigterm.pid");
+  const ChildResult running_submit =
+      runClient({"submit", "--", "/bin/sh", "-c",
+                 "trap '' TERM; echo $$ > \"$1\"; while :; do :; done",
+                 "runnerd-integration-test", ready_file});
   ASSERT_EQ(running_submit.exit_code, 0) << running_submit.standard_error;
 
-  const ChildResult running_status = waitForJobState("2", "RUNNING");
-  ASSERT_EQ(running_status.exit_code, 0) << running_status.standard_error;
+  ASSERT_GT(waitForPidFile(ready_file), 0);
 
   const ChildResult running = runClient({"cancel", "2"});
-  EXPECT_NE(running.exit_code, 0);
-  EXPECT_NE(running.standard_error.find("running job cancellation is not available yet"),
+  ASSERT_EQ(running.exit_code, 0) << running.standard_error;
+  EXPECT_EQ(running.standard_output, "Cancellation requested for job 2\n");
+
+  const ChildResult terminating_status = runClient({"status", "2"});
+  ASSERT_EQ(terminating_status.exit_code, 0) << terminating_status.standard_error;
+  EXPECT_NE(terminating_status.standard_output.find("state=TERMINATING"), std::string::npos)
+      << terminating_status.standard_output;
+
+  const ChildResult repeated_running_cancel = runClient({"cancel", "2"});
+  EXPECT_NE(repeated_running_cancel.exit_code, 0);
+  EXPECT_NE(repeated_running_cancel.standard_error.find("already terminating"),
             std::string::npos);
 
   const ChildResult queued_submit = runClient({"submit", "--", "/bin/sleep", "30"});
@@ -670,6 +727,54 @@ TEST_F(RunnerdIntegrationTest, RejectsMissingRunningTerminalAndRepeatedCancellat
   const ChildResult repeated_cancel = runClient({"cancel", "3"});
   EXPECT_NE(repeated_cancel.exit_code, 0);
   EXPECT_NE(repeated_cancel.standard_error.find("already terminal"), std::string::npos);
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, CancelsRunningProcessGroupAndStartsNextQueuedJob) {
+  const std::string descendant_pid_file = makeTemporaryFilePath("descendant.pid");
+
+  // 非交互 shell 的后台 sleep 与 shell 位于同一个进程组。
+  // 如果 daemon 只终止直接子进程，sleep 会继续持有 stdout/stderr pipe，
+  // Job 1 无法结算，Job 2 也无法获得唯一的运行槽位。
+  const ChildResult first_submit =
+      runClient({"submit", "--", "/bin/sh", "-c", "sleep 5 & echo $! > \"$1\"; wait",
+                 "runnerd-integration-test", descendant_pid_file});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(first_submit.standard_output, "1\n");
+
+  const pid_t descendant_pid = waitForPidFile(descendant_pid_file);
+  ASSERT_GT(descendant_pid, 0);
+  ASSERT_EQ(::kill(descendant_pid, 0), 0) << std::strerror(errno);
+
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/true"});
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(second_submit.standard_output, "2\n");
+
+  const ChildResult queued_status = runClient({"status", "2"});
+  ASSERT_EQ(queued_status.exit_code, 0) << queued_status.standard_error;
+  ASSERT_NE(queued_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << queued_status.standard_output;
+
+  const ChildResult cancellation = runClient({"cancel", "1"});
+  ASSERT_EQ(cancellation.exit_code, 0) << cancellation.standard_error;
+  EXPECT_EQ(cancellation.standard_output, "Cancellation requested for job 1\n");
+
+  const ChildResult cancelled_status = waitForJobState("1", "CANCELLED");
+  ASSERT_EQ(cancelled_status.exit_code, 0)
+      << cancelled_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(cancelled_status.standard_output.find("state=CANCELLED"), std::string::npos)
+      << cancelled_status.standard_output;
+  EXPECT_NE(cancelled_status.standard_output.find("exit_signal=15"), std::string::npos)
+      << cancelled_status.standard_output;
+
+  const ChildResult second_status = waitForJobState("2", "SUCCEEDED");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=SUCCEEDED"), std::string::npos)
+      << second_status.standard_output;
+
+  EXPECT_TRUE(waitForProcessToDisappear(descendant_pid));
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
