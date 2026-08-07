@@ -22,6 +22,7 @@
 #include "runnerd/job_scheduler.h"
 #include "runnerd/process_monitor.h"
 #include "runnerd/protocol.h"
+#include "runnerd/timeout_manager.h"
 #include "runnerd/unix_socket.h"
 
 namespace {
@@ -154,47 +155,57 @@ using Jobs = runnerd::JobTable;
 // 1. 等待队列为空；或
 // 2. 所有运行槽位都已被预留。
 //
-// 注意：这个函数只负责把 Scheduler 和 ProcessMonitor 串起来。
-// JobScheduler 不知道进程，ProcessMonitor 也不知道 FIFO 策略。
+// daemon 在这里把三个模块串起来：
+//
+// JobScheduler
+//     负责给出下一个 JobId；
+//
+// ProcessMonitor
+//     负责启动并监控进程；
+//
+// TimeoutManager
+//     负责在任务真正进入 RUNNING 后登记执行期限。
 void pumpScheduler(Jobs& jobs, runnerd::JobScheduler& scheduler,
-                   runnerd::ProcessMonitor& process_monitor) {
+                   runnerd::ProcessMonitor& process_monitor,
+                   runnerd::TimeoutManager& timeout_manager) {
   for (;;) {
-    // takeNextJobToStart() 成功时，Scheduler 已经为该任务预留了一个槽位。
+    // 成功取出 JobId 时，Scheduler 已经为它预留了运行槽位。
     const std::optional<runnerd::JobId> next_job_id = scheduler.takeNextJobToStart();
 
     if (!next_job_id.has_value()) {
-      // 没有等待任务，或者没有空闲槽位。
+      // 队列为空，或者已经没有空闲槽位。
       return;
     }
 
     const runnerd::JobId job_id = *next_job_id;
 
-    // startJob() 的正常结果有两类：
-    //
-    // 1. 启动成功：
-    //    Job 从 QUEUED 变为 RUNNING，槽位继续被 Scheduler 保留。
-    //
-    // 2. 同步启动失败：
-    //    例如 fork 失败、监控 fd 注册失败。
-    //    ProcessMonitor 会把 Job 变为 FAILED。
     process_monitor.startJob(job_id);
 
     const runnerd::Job& job = jobs.at(job_id);
 
     if (runnerd::isTerminal(job.state)) {
-      // 此任务在 startJob() 内同步失败，已经不会再收到后续的
-      // SIGCHLD / pipe / EOF 事件，因此必须立刻归还刚才预留的槽位。
+      // startJob() 内发生同步启动失败。
+      //
+      // 这种任务没有真正进入 RUNNING，
+      // 因此不能登记 execution_timeout。
       scheduler.onJobReachedTerminalState(job_id);
 
-      // 归还槽位后，可能可以立刻启动队列中的下一个任务。
+      // 槽位已经归还，继续尝试启动下一项。
       continue;
     }
 
     if (job.state != runnerd::JobState::kRunning) {
-      // 这是内部不变量检查：
-      // 调度器取出的 QUEUED Job，调用 startJob 后，要么 FAILED，
-      // 要么 RUNNING；出现第三种状态说明模块之间的约定被破坏。
       throw std::logic_error("started job is neither RUNNING nor terminal");
+    }
+
+    if (job.spec.execution_timeout.has_value()) {
+      // 超时从 RUNNING 开始，而不是从 SUBMIT 开始。
+      //
+      // 因此任务在 QUEUED 中等待多久，都不会消耗执行时间。
+      timeout_manager.schedule(job_id, *job.spec.execution_timeout);
+
+      std::cout << "scheduled timeout for job " << job_id << ": "
+                << job.spec.execution_timeout->count() << " ms\n";
     }
   }
 }
@@ -206,28 +217,38 @@ using TerminalJobNotifications = std::deque<runnerd::JobId>;
 // 处理所有已经收到的终态通知。
 void processTerminalJobNotifications(Jobs& jobs, runnerd::JobScheduler& scheduler,
                                      runnerd::ProcessMonitor& process_monitor,
+                                     runnerd::TimeoutManager& timeout_manager,
                                      TerminalJobNotifications& notifications) {
   while (!notifications.empty()) {
     const runnerd::JobId job_id = notifications.front();
+
     notifications.pop_front();
 
     const auto job_it = jobs.find(job_id);
 
     if (job_it == jobs.end()) {
-      // ProcessMonitor 上报的 Job 必须仍属于 daemon 的 JobTable。
       throw std::logic_error("terminal notification refers to an unknown job");
     }
 
     if (!runnerd::isTerminal(job_it->second.state)) {
-      // 回调语义是“已经终态”，不是“收到了 SIGCHLD”。
-      // 如果仍是 RUNNING，说明 ProcessMonitor 的时序被破坏。
       throw std::logic_error("terminal notification refers to a non-terminal job");
     }
 
+    // 无论任务是成功、失败、取消还是超时，
+    // 进入终态后都不再需要执行期限。
+    //
+    // cancel() 是幂等的。
+    // 如果任务本身就是因为超时结束，这里的期限可能已经被取出，
+    // 再调用一次 cancel() 也没有影响。
+    timeout_manager.cancel(job_id);
+
+    // 任务已经真正结算完成，可以归还运行槽位。
     scheduler.onJobReachedTerminalState(job_id);
 
-    // 归还槽位后，立即尝试启动 FIFO 队列的后续任务。
-    pumpScheduler(jobs, scheduler, process_monitor);
+    // 槽位归还后，立即尝试启动 FIFO 队列中的下一项。
+    //
+    // 新任务进入 RUNNING 后，也会在 pumpScheduler 内登记超时。
+    pumpScheduler(jobs, scheduler, process_monitor, timeout_manager);
   }
 }
 
@@ -407,7 +428,8 @@ std::string makeListResponse(const Jobs& jobs) {
 
 // 取消一个任务。
 std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& scheduler,
-                      runnerd::ProcessMonitor& process_monitor) {
+                      runnerd::ProcessMonitor& process_monitor,
+                      runnerd::TimeoutManager& timeout_manager) {
   const auto job_it = jobs.find(job_id);
 
   if (job_it == jobs.end()) {
@@ -443,6 +465,7 @@ std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& 
         // 此时不能擅自把任务标记 CANCELLED。
         return "ERR job process already exited; retry status";
       }
+      timeout_manager.cancel(job_id);
       return "OK terminating";
     } catch (const std::system_error& exception) {
       // 保持 Job 为 RUNNING，不改变 termination_cause，
@@ -468,7 +491,8 @@ std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& 
 
 std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId& next_job_id,
                           runnerd::JobScheduler& scheduler,
-                          runnerd::ProcessMonitor& process_monitor) {
+                          runnerd::ProcessMonitor& process_monitor,
+                          runnerd::TimeoutManager& timeout_manager) {
   if (request == "PING") {
     std::cout << "received PING\n";
     return "PONG";
@@ -497,7 +521,7 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
     try {
       const runnerd::JobId job_id = runnerd::decodeCancelRequest(request);
 
-      return cancelJob(job_id, jobs, scheduler, process_monitor);
+      return cancelJob(job_id, jobs, scheduler, process_monitor, timeout_manager);
     } catch (const std::invalid_argument& exception) {
       // 客户端发送的是 CANCEL 前缀，但二进制结构不合法。
       // 这属于普通协议错误，不应该让 daemon 退出。
@@ -554,7 +578,7 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
     ++next_job_id;
 
     // 根据当前空闲槽位，尽可能启动 FIFO 队列中的任务。
-    pumpScheduler(jobs, scheduler, process_monitor);
+    pumpScheduler(jobs, scheduler, process_monitor, timeout_manager);
 
     std::cout << "accepted job " << job_id << '\n';
 
@@ -573,7 +597,8 @@ std::string handleRequest(const std::string& request, Jobs& jobs, runnerd::JobId
 // false：发生无法恢复的读取错误，需要清理连接。
 bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
                       runnerd::JobId& next_job_id, runnerd::JobScheduler& scheduler,
-                      runnerd::ProcessMonitor& process_monitor) {
+                      runnerd::ProcessMonitor& process_monitor,
+                      runnerd::TimeoutManager& timeout_manager) {
   char buffer[4096];
   for (;;) {
     const ssize_t n = ::read(client_fd, buffer, sizeof(buffer));
@@ -586,7 +611,7 @@ bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
         const std::string request = connection.decoder.popFrame();
 
         const std::string response_payload =
-            handleRequest(request, jobs, next_job_id, scheduler, process_monitor);
+            handleRequest(request, jobs, next_job_id, scheduler, process_monitor, timeout_manager);
 
         const std::vector<char> response = runnerd::encodeFrame(response_payload);
 
@@ -612,6 +637,78 @@ bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
     }
 
     return false;
+  }
+}
+
+// 处理一次 timerfd 事件。
+//
+// TimeoutManager 只返回已经到期的 JobId。
+// daemon 再调用 ProcessMonitor 请求终止对应进程。
+void handleTimeoutEvent(std::uint32_t event_mask, Jobs& jobs,
+                        runnerd::TimeoutManager& timeout_manager,
+                        runnerd::ProcessMonitor& process_monitor) {
+  if ((event_mask & (EPOLLERR | EPOLLHUP)) != 0) {
+    // timerfd 出现错误意味着 daemon 已无法可靠执行超时策略。
+    throw std::runtime_error("timerfd reported EPOLLERR or EPOLLHUP");
+  }
+
+  const std::vector<runnerd::JobId> expired_jobs = timeout_manager.handleReadable();
+
+  for (const runnerd::JobId job_id : expired_jobs) {
+    const auto job_it = jobs.find(job_id);
+
+    if (job_it == jobs.end()) {
+      // TimeoutManager 中的 JobId 必须来自 JobTable。
+      throw std::logic_error("timeout refers to an unknown job");
+    }
+
+    runnerd::Job& job = job_it->second;
+
+    if (job.state != runnerd::JobState::kRunning) {
+      // 正常情况下：
+      //
+      // - 自然终态会调用 timeout_manager.cancel()；
+      // - 手动取消成功也会调用 timeout_manager.cancel()。
+      //
+      // 这里保留防御性检查，避免对非 RUNNING 任务再次发信号。
+      std::cerr << "ignored timeout for job " << job_id << " because its state is "
+                << runnerd::jobStateName(job.state) << '\n';
+
+      continue;
+    }
+
+    // 复用第 4 天已经实现的进程组终止逻辑。
+    //
+    // 成功后：
+    //   RUNNING -> TERMINATING
+    //   termination_cause = kTimedOut
+    //
+    // 最终仍要等待：
+    //   child_exited
+    //   stdout_eof
+    //   stderr_eof
+    //   startup_error_eof
+    //
+    // 全部成立后，ProcessMonitor 才会结算为 TIMED_OUT。
+    const bool requested =
+        process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kTimedOut);
+
+    if (!requested) {
+      // kill 返回 ESRCH，表示进程组已经不存在。
+      //
+      // 子进程可能在期限到达前刚刚自然退出，
+      // 只是 SIGCHLD 事件还没有被处理。
+      //
+      // 这种情况下不强行标记 TIMED_OUT，
+      // 后续 waitpid 根据真实退出结果结算。
+      std::cout << "job " << job_id
+                << " reached its deadline, but the process "
+                   "had already exited\n";
+
+      continue;
+    }
+
+    std::cout << "execution timeout reached for job " << job_id << '\n';
   }
 }
 
@@ -665,6 +762,8 @@ int main(int argc, char* argv[]) {
 
     runnerd::ProcessMonitor process_monitor(epoll_fd, jobs);
 
+    runnerd::TimeoutManager timeout_manager(epoll_fd);
+
     process_monitor.setTerminalJobCallback([&terminal_job_notifications](runnerd::JobId job_id) {
       terminal_job_notifications.push_back(job_id);
     });
@@ -702,6 +801,12 @@ int main(int argc, char* argv[]) {
           continue;
         }
 
+        // timerfd 到期也是普通的 epoll 事件。
+        if (fd == timeout_manager.fileDescriptor()) {
+          handleTimeoutEvent(event_mask, jobs, timeout_manager, process_monitor);
+          continue;
+        }
+
         if (process_monitor.ownsFileDescriptor(fd)) {
           process_monitor.handleFileDescriptorEvent(fd, event_mask);
 
@@ -710,7 +815,7 @@ int main(int argc, char* argv[]) {
           //
           // 现在已经离开 ProcessMonitor 的内部结算逻辑，
           // 可以安全释放槽位并启动下一个 FIFO 任务。
-          processTerminalJobNotifications(jobs, scheduler, process_monitor,
+          processTerminalJobNotifications(jobs, scheduler, process_monitor, timeout_manager,
                                           terminal_job_notifications);
           continue;
         }
@@ -734,8 +839,8 @@ int main(int argc, char* argv[]) {
           // EPOLLIN 表示有数据可读；EPOLLRDHUP 表示对端关闭了发送方向。
           // 两者可能同时出现，所以仍要调用 read 把对端最后发送的数据读完。
           if (connection_alive && (event_mask & (EPOLLIN | EPOLLRDHUP)) != 0) {
-            connection_alive =
-                handleClientRead(fd, it->second, jobs, next_job_id, scheduler, process_monitor);
+            connection_alive = handleClientRead(fd, it->second, jobs, next_job_id, scheduler,
+                                                process_monitor, timeout_manager);
           }
 
           // EPOLLOUT 表示当前可以继续写。handleClientWrite 会从 write_offset

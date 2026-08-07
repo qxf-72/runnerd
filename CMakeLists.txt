@@ -133,6 +133,33 @@ target_compile_options(runnerd_scheduler PRIVATE
     -Wpedantic
 )
 
+# 使用 timerfd 和最小堆管理任务执行期限。
+#
+# TimeoutManager 只负责时间，不直接修改任务状态，
+# 也不直接向进程发送信号。
+add_library(runnerd_timeout STATIC
+    src/timeout_manager.cpp
+)
+
+target_include_directories(runnerd_timeout PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(runnerd_timeout PUBLIC
+    runnerd_job
+)
+
+target_compile_options(runnerd_timeout PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+# timerfd 是 Linux 接口。
+target_compile_definitions(runnerd_timeout PRIVATE
+    _GNU_SOURCE
+)
+
 # 常驻任务执行服务。
 add_executable(runnerd
     src/runnerd_main.cpp
@@ -148,6 +175,7 @@ target_link_libraries(runnerd PRIVATE
     runnerd_monitor
     runnerd_protocol
     runnerd_scheduler
+    runnerd_timeout
 )
 
 target_compile_options(runnerd PRIVATE

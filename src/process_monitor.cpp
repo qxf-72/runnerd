@@ -546,8 +546,11 @@ void ProcessMonitor::tryFinalizeJob(JobId job_id) {
         break;
 
       case TerminationCause::kTimedOut:
-        // Day 6 才会真正使用这个分支。
-        // 现在先保持状态机的完整性。
+        // TimeoutManager 在执行期限到达时调用
+        // requestTerminate(job_id, kTimedOut)。
+        //
+        // 此处已经确认子进程退出且所有输出管道 EOF，
+        // 因此可以完成 TERMINATING -> TIMED_OUT。
         transitionJob(job, JobState::kTimedOut);
         break;
     }
