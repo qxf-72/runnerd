@@ -461,8 +461,8 @@ std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& 
           process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kCancelled);
 
       if (!requested) {
-        // 进程组已经不存在，但 SIGCHLD 可能尚未被事件循环处理。
-        // 此时不能擅自把任务标记 CANCELLED。
+        // ProcessMonitor 在发送 SIGTERM 前发现进程已经自然退出。
+        // 此时任务会按照真实 waitpid 结果结算，不能改成 CANCELLED。
         return "ERR job process already exited; retry status";
       }
       timeout_manager.cancel(job_id);
@@ -694,13 +694,9 @@ void handleTimeoutEvent(std::uint32_t event_mask, Jobs& jobs,
         process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kTimedOut);
 
     if (!requested) {
-      // kill 返回 ESRCH，表示进程组已经不存在。
-      //
-      // 子进程可能在期限到达前刚刚自然退出，
-      // 只是 SIGCHLD 事件还没有被处理。
-      //
-      // 这种情况下不强行标记 TIMED_OUT，
-      // 后续 waitpid 根据真实退出结果结算。
+      // ProcessMonitor 在发送 SIGTERM 前发现进程已经自然退出，
+      // 并按照真实 waitpid 结果进行结算。
+      // 这种情况下不能再把任务标记为 TIMED_OUT。
       std::cout << "job " << job_id
                 << " reached its deadline, but the process "
                    "had already exited\n";

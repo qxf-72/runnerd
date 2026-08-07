@@ -27,6 +27,9 @@ class ProcessMonitor {
   void startJob(JobId job_id);
 
   // 请求终止一个正在运行的任务。
+  //
+  // 返回 true 表示已经向进程组发送 SIGTERM，任务进入 TERMINATING。
+  // 返回 false 表示直接子进程在信号发送前已经退出，任务会按照真实退出结果结算。
   bool requestTerminate(JobId job_id, TerminationCause cause);
 
   bool ownsFileDescriptor(int fd) const;

@@ -297,10 +297,78 @@ bool ProcessMonitor::requestTerminate(JobId job_id, TerminationCause cause) {
     throw std::logic_error("only RUNNING jobs can be terminated");
   }
 
-  const auto active_it = active_jobs_.find(job_id);
+  auto active_it = active_jobs_.find(job_id);
 
   if (active_it == active_jobs_.end()) {
     throw std::logic_error("running job has no active process");
+  }
+
+  // 子进程可能已经自然退出并成为僵尸进程，只是事件循环还没有处理 SIGCHLD。
+  // 此时向进程组发送信号仍可能成功，所以不能只依靠 kill() 的 ESRCH 判断。
+  //
+  // 先使用 WNOHANG 检查一次直接子进程。如果已经退出，就保存真实 waitpid 结果，
+  // 并主动排空三个非阻塞管道，尽可能在发送 SIGTERM 前完成自然结算。
+  ActiveProcess& current_process = active_it->second;
+
+  if (!current_process.child_exited) {
+    for (;;) {
+      int wait_status = 0;
+      const pid_t wait_result = ::waitpid(current_process.pid, &wait_status, WNOHANG);
+
+      if (wait_result == current_process.pid) {
+        current_process.child_exited = true;
+        current_process.wait_status = wait_status;
+        break;
+      }
+
+      if (wait_result == 0) {
+        break;
+      }
+
+      const int error_number = errno;
+
+      if (error_number == EINTR) {
+        continue;
+      }
+
+      if (error_number == ECHILD) {
+        throw std::logic_error("running job child was reaped without being recorded");
+      }
+
+      throw std::system_error(error_number, std::generic_category(),
+                              "check child before sending SIGTERM");
+    }
+  }
+
+  if (current_process.child_exited) {
+    // drainProcessFd() 可能关闭 fd，因此先复制当前的三个描述符。
+    const std::array<int, 3> process_fds{
+        current_process.stdout_fd,
+        current_process.stderr_fd,
+        current_process.startup_error_fd,
+    };
+
+    for (const int fd : process_fds) {
+      if (fd != -1) {
+        drainProcessFd(fd);
+      }
+    }
+
+    tryFinalizeJob(job_id);
+
+    if (isTerminal(job.state)) {
+      // 子进程及其输出都已经自然结束，不能再把任务改成
+      // CANCELLED 或 TIMED_OUT。
+      return false;
+    }
+
+    // 直接子进程虽然已经退出，但后代进程仍可能持有输出管道。
+    // 这种情况下任务尚未完成，继续终止剩余进程组。
+    active_it = active_jobs_.find(job_id);
+
+    if (active_it == active_jobs_.end()) {
+      throw std::logic_error("non-terminal job has no active process");
+    }
   }
 
   ActiveProcess& process = active_it->second;
@@ -325,7 +393,7 @@ bool ProcessMonitor::requestTerminate(JobId job_id, TerminationCause cause) {
     }
 
     if (error_number == ESRCH) {
-      // 子进程可能已经自然退出，只是 SIGCHLD 尚未在事件循环中处理。
+      // 进程可能在上面的 waitpid 检查之后、kill 调用之前退出。
       //
       // 不允许此时擅自把 Job 改成 CANCELLED；
       // 后续 waitpid 会根据真实退出结果结算。
