@@ -14,9 +14,9 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 
 当前已经实现 Unix Domain Socket 通信、长度前缀协议、非阻塞 `epoll`
 事件循环、连接读写状态、并发客户端测试、任务数据模型、状态机规则、
-进程启动、输出采集、子进程回收，以及 FIFO 调度器和完整的并发槽位闭环。
+进程启动、输出采集、子进程回收、FIFO 调度器、运行中取消和执行超时。
 
-`runnerctl` 已支持提交、查询、列出和取消排队任务。runnerd 会解码并校验
+`runnerctl` 已支持提交、查询、列出以及取消排队或运行中的任务。runnerd 会解码并校验
 `JobSpec`、分配 JobId，将任务保存到内存表并加入 FIFO 队列。
 `--max-running` 控制并发运行槽位，
 默认值为 `1`；超出容量的任务保持 `QUEUED`。stdout/stderr 通过非阻塞 pipe
@@ -24,8 +24,9 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 结算。任务最终结算后，daemon 会释放运行槽位并自动启动 FIFO 队首。
 `status` 可以查询单个任务，`list` 会按 JobId 顺序列出内存中的任务。
 
-`cancel` 当前只适用于尚未启动的 `QUEUED` 任务；运行中任务的进程组终止流程
-尚未实现。daemon 重启后内存任务、输出及 JobId 计数都会丢失。
+运行中取消和执行超时都会向整个任务进程组发送 `SIGTERM`，并在直接子进程退出、
+三个输出管道 EOF 后，根据终止原因结算为 `CANCELLED` 或 `TIMED_OUT`。当前尚无
+宽限期后的 `SIGKILL` 升级；daemon 重启后内存任务、输出及 JobId 计数都会丢失。
 
 ## 第一阶段核心功能
 
@@ -51,7 +52,9 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 
 - [x] `--max-running`、FIFO 等待队列、终态槽位释放和队列自动推进
 - [x] 从 FIFO 等待队列取消尚未启动的任务
-- [ ] 运行中任务终止和执行超时
+- [x] 运行中任务的进程组 `SIGTERM` 终止
+- [x] 基于最小堆和单个 `timerfd` 的执行超时
+- [ ] 宽限期后的进程组 `SIGKILL` 强制终止
 - [ ] 任务历史持久化
 - [ ] runnerd 重启后的任务状态恢复
 
@@ -66,7 +69,9 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - [x] 进程启动、输出采集、execve 失败和并发回收测试
 - [x] FIFO 调度器单元测试，以及最大并发、自动推进和失败恢复调度集成测试
 - [x] CANCEL 协议、命令行校验和排队取消集成测试
-- [ ] 运行中取消、超时和恢复的集成测试
+- [x] 运行中取消、进程组终止和自然退出竞争测试
+- [x] TimeoutManager 单元测试和真实 daemon 超时集成测试
+- [ ] 持久化与重启恢复测试
 
 ## 当前 daemon 启动参数
 
@@ -99,11 +104,28 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - stdout/stderr 当前保存在内存中，尚不能通过 `runnerctl` 查询，也没有
   输出大小上限。
 - 客户端连接关闭不会删除或终止任务。
-- timeout 当前只被保存，不会触发计时或终止。
+- 任务成功进入 `RUNNING` 后，daemon 才会登记 `execution_timeout`；FIFO
+  排队时间不计入执行时间。
 - 运行任务最终结算后，`ProcessMonitor` 会通知 daemon 归还调度器槽位；daemon
   随后继续调度，按 FIFO 顺序启动下一个等待任务。
 - 如果任务在同步启动阶段失败，daemon 会立即归还槽位并继续调度后续任务。
 - 所有任务、输出和结果仍只存在于 daemon 内存中。
+
+## 当前超时行为
+
+- `TimeoutManager` 使用 `CLOCK_MONOTONIC`、一个非阻塞且带 `CLOEXEC` 的
+  `timerfd`，以及一个最小堆管理所有运行任务的 deadline。
+- timerfd 始终设置为最近的有效 deadline。相同 JobId 重新登记期限时使用
+  generation 使旧堆节点失效；任务自然结束或被取消后使用惰性删除使期限失效。
+- timerfd 可读时会一次取出当前所有已经到期的有效 JobId。daemon 再次确认任务
+  仍为 `RUNNING`，随后向整个进程组发送 `SIGTERM`，执行
+  `RUNNING -> TERMINATING` 并记录 `TerminationCause::kTimedOut`。
+- 只有直接子进程已经退出，stdout、stderr 和 startup-error 三个管道全部 EOF 后，
+  任务才从 `TERMINATING` 结算为 `TIMED_OUT`，然后释放运行槽位并启动 FIFO 队首。
+- 自然退出与 deadline 同时到达时，`ProcessMonitor` 会在发送信号前使用非阻塞
+  `waitpid` 检查真实退出结果，避免把已经完成的任务错误标记为 `TIMED_OUT`。
+- 当前没有宽限期后的 `SIGKILL` 升级。忽略 `SIGTERM` 的超时任务会保持
+  `TERMINATING`，这是下一阶段要解决的限制。
 
 ## 当前 CANCEL 行为
 
@@ -111,16 +133,20 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
   `uint64_t` 范围内的大于 0 的十进制整数。
 - 线协议 payload 为 `CANCEL` 加 8 字节大端 JobId；长度、前缀或 JobId
   不合法时返回明确错误。
-- 只有状态为 `QUEUED` 的任务可以取消。daemon 会先从 `JobScheduler` 的 FIFO
-  等待队列中移除该任务，再执行 `QUEUED -> CANCELLED`，避免任务进入终态后
-  仍被启动。
-- 取消成功时服务端返回 `OK cancelled`，客户端输出 `Cancelled job <job_id>`；
-  后续 `status` 和 `list` 都会显示 `CANCELLED`。
+- `QUEUED` 任务取消时，daemon 会先从 `JobScheduler` 的 FIFO 等待队列中移除
+  该任务，再执行 `QUEUED -> CANCELLED`，避免任务进入终态后仍被启动。服务端
+  返回 `OK cancelled`，客户端输出 `Cancelled job <job_id>`。
+- `RUNNING` 任务取消时，`ProcessMonitor` 向负进程组 ID 发送 `SIGTERM`，执行
+  `RUNNING -> TERMINATING` 并记录 `TerminationCause::kCancelled`。三个管道 EOF
+  且直接子进程退出后，任务结算为 `CANCELLED`。服务端返回 `OK terminating`，
+  客户端输出 `Cancellation requested for job <job_id>`。
+- 运行中取消成功后，对应执行期限会立即失效，不能再把任务改成 `TIMED_OUT`。
 - 任务不存在、已经进入终态或正在终止时，取消请求会返回错误且不改变状态。
   重复取消当前也返回“任务已是终态”，因此该接口不是幂等成功接口。
-- `RUNNING` 任务目前不会收到信号，取消请求返回
-  `ERR running job cancellation is not available yet`。进程组终止流程将在后续
-  实现。
+- 如果直接子进程在取消信号发送前已经自然退出，`ProcessMonitor` 会保留真实退出
+  结果，不会把任务错误标记为 `CANCELLED`。
+- 当前没有宽限期后的 `SIGKILL` 升级。忽略 `SIGTERM` 的任务会保持
+  `TERMINATING`。
 
 ## 当前查询行为
 
@@ -139,7 +165,8 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 
 每个任务保存唯一的任务 ID、原始执行参数和当前状态。启动后记录子进程 ID、
 进程组 ID、stdout/stderr，以及最终的退出码或退出信号。无法启动或执行任务
-时保存失败阶段和系统错误信息。终止原因将在运行中取消和超时功能接入后使用。
+时保存失败阶段和系统错误信息。运行中取消或执行超时时还会记录终止原因，用于
+在进程退出并排空输出后选择 `CANCELLED` 或 `TIMED_OUT`。
 
 ## 明确不做
 

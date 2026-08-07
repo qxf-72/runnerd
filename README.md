@@ -23,7 +23,7 @@
 
 > [!WARNING]
 > **实验性软件。** `runnerd` 仅适用于可信的单用户 Linux 环境。目前没有认证、
-> 沙箱隔离、持久化、真正生效的执行超时机制，也没有输出大小限制；请勿将其暴露给
+> 沙箱隔离、持久化，也没有输出大小限制；请勿将其暴露给
 > 不受信任的用户或工作负载。
 
 ## ✨ 为什么选择 runnerd？
@@ -39,6 +39,7 @@
 | 进程监管 | 通过 `fork/execve` 和独立进程组启动任务，全程不经过 shell。 |
 | 有界并发 | `--max-running` 设置运行槽位，超额任务进入 FIFO 等待队列。 |
 | 任务取消 | 排队任务直接移除；运行中任务会向整个进程组发送 `SIGTERM`，并在输出排空后结算。 |
+| 执行超时 | 一个 `timerfd` 配合最小堆管理全部运行期限；到期任务通过进程组 `SIGTERM` 终止。 |
 | 可观测生命周期 | `signalfd + waitpid` 配合非阻塞 stdout/stderr 管道，驱动有文档说明的任务状态机。 |
 | 可验证行为 | GoogleTest 与 CTest 覆盖协议、状态转移、进程启动、监控和端到端流程。 |
 
@@ -78,7 +79,7 @@ cmake --build build --parallel
 ./build/runnerctl ping
 # PONG
 
-./build/runnerctl submit -- /bin/sleep 10
+./build/runnerctl submit --timeout 1000 -- /bin/sleep 10
 # 1
 
 ./build/runnerctl status 1
@@ -106,6 +107,8 @@ cmake --build build --parallel
 - 运行任务进入终态后会释放运行槽位，daemon 随即按 FIFO 顺序启动等待队首。
 - `runnerctl cancel <job_id>` 会直接取消 `QUEUED` 任务；对于 `RUNNING` 任务，
   daemon 会向整个进程组发送 `SIGTERM`，并在子进程退出且输出排空后标记为 `CANCELLED`。
+- `--timeout <ms>` 从任务进入 `RUNNING` 后开始计时，不包含 FIFO 排队时间；期限
+  到达后任务先进入 `TERMINATING`，完成结算后变为 `TIMED_OUT`。
 - 当前还没有宽限期后的 `SIGKILL` 升级；忽略 `SIGTERM` 的任务会保持 `TERMINATING`。
 
 ## 🏗️ 架构
@@ -124,6 +127,8 @@ flowchart TB
         Jobs[("内存任务表<br/>状态 · 元数据 · 已采集输出")]
         Scheduler["JobScheduler<br/>FIFO 队列 · 运行槽位"]
         Monitor["ProcessMonitor"]
+        Timeout["TimeoutManager<br/>最小堆 · 惰性删除"]
+        Timer["timerfd<br/>CLOCK_MONOTONIC"]
         Launcher["process_launcher<br/>fork / execve · 进程组"]
         Signal["signalfd<br/>SIGCHLD"]
         Pipes[/"非阻塞管道<br/>stdout · stderr · 启动错误"/]
@@ -140,6 +145,12 @@ flowchart TB
         Jobs -->|"取消排队任务"| Scheduler
         Jobs -->|"终止运行任务"| Monitor
         Scheduler -->|"取得启动资格"| Monitor --> Launcher
+        Monitor -->|"RUNNING · 登记期限"| Timeout
+        Timeout -->|"设置最近 deadline"| Timer
+        Timer -->|"到期事件"| Loop
+        Loop -->|"读取到期任务"| Timeout
+        Timeout -->|"请求超时终止"| Monitor
+        Monitor -->|"终态 · 期限失效"| Timeout
         Pipes -->|"输出 / 启动错误事件"| Loop
         Signal -->|"子进程退出事件"| Loop
         Loop -->|"分派 fd / 信号事件"| Monitor
@@ -160,6 +171,9 @@ flowchart TB
 `ProcessMonitor` 随后通知 daemon 释放运行槽位，daemon 再继续启动 FIFO 队首任务。
 取消运行任务时，`ProcessMonitor` 向负进程组 ID 发送 `SIGTERM`，继续监听并排空
 stdout/stderr，最后根据终止原因把任务从 `TERMINATING` 结算为 `CANCELLED`。
+任务成功进入 `RUNNING` 后，daemon 才会把可选的执行期限登记到 `TimeoutManager`。
+它用最小堆和 generation 惰性删除管理全部期限，并只把最近期限设置给单个
+`timerfd`；到期任务复用同一套进程组终止流程，最终结算为 `TIMED_OUT`。
 
 ## 🧩 项目结构
 
@@ -171,6 +185,7 @@ stdout/stderr，最后根据终止原因把任务从 `TERMINATING` 结算为 `CA
 | `src/job_scheduler.cpp` | FIFO 等待顺序、最大并发槽位和排队任务移除。 |
 | `src/process_launcher.cpp` | pipe、`fork/execve`、标准流重定向和进程组创建。 |
 | `src/process_monitor.cpp` | `epoll` 注册、输出采集、`SIGCHLD` 处理与任务结算。 |
+| `src/timeout_manager.cpp` | 使用最小堆和单个 `timerfd` 管理任务执行期限。 |
 | `src/runnerd_main.cpp` | daemon 入口和事件循环。 |
 | `src/runnerctl_main.cpp` | 命令行客户端和用户可见的输出。 |
 | `tests/` | 单元测试与真实 daemon 的端到端集成测试。 |
@@ -203,12 +218,14 @@ stdout/stderr，最后根据终止原因把任务从 `TERMINATING` 结算为 `CA
 退出码 `0` 退出时任务变为 `SUCCEEDED`；启动失败、非零退出码或被信号终止时则为
 `FAILED`。启动前发生资源创建或注册失败时，任务也可以直接从 `QUEUED` 进入
 `FAILED`；尚未启动的任务被取消时会从 `QUEUED` 进入 `CANCELLED`。运行中任务
-收到取消请求后先进入 `TERMINATING`，进程退出且输出排空后再进入 `CANCELLED`。
+收到取消请求或超过执行期限后先进入 `TERMINATING`，进程退出且输出排空后，
+再根据终止原因进入 `CANCELLED` 或 `TIMED_OUT`。
 
 ```text
 QUEUED ──> RUNNING ──> SUCCEEDED
    │          ├──────> FAILED
-   │          └──────> TERMINATING ──> CANCELLED
+   │          └──────> TERMINATING ──┬──> CANCELLED
+   │                                 └──> TIMED_OUT
    ├─────────────────> FAILED
    └─────────────────> CANCELLED
 ```
@@ -236,11 +253,11 @@ QUEUED ──> RUNNING ──> SUCCEEDED
 
 | 领域 | 当前行为 |
 | --- | --- |
-| 超时 | `--timeout` 会被校验并保存到 `JobSpec`，但目前不会终止超时任务。 |
+| 超时 | `--timeout` 从任务进入 `RUNNING` 后开始计算，不包含排队时间；一个 `timerfd` 管理全部期限，到期后向任务进程组发送 `SIGTERM` 并最终结算为 `TIMED_OUT`。 |
 | 调度 | `--max-running` 限制并发运行数；超额任务按 FIFO 保持 `QUEUED`，运行任务结算后自动释放槽位并启动队首。 |
 | 任务数据 | 任务元数据和已采集输出仅保存在内存中，daemon 重启后丢失。 |
 | 输出 | stdout/stderr 会被采集，但暂不能通过 `runnerctl` 查询，且未设大小上限。 |
-| 控制 | `QUEUED` 任务直接取消；`RUNNING` 任务通过进程组 `SIGTERM` 进入 `TERMINATING`，排空输出后变为 `CANCELLED`。尚无 `SIGKILL` 升级，忽略信号的任务会停留在 `TERMINATING`。 |
+| 控制 | `QUEUED` 任务直接取消；运行中取消和执行超时都会通过进程组 `SIGTERM` 进入 `TERMINATING`，排空输出后按原因结算。尚无 `SIGKILL` 升级，忽略信号的任务会停留在 `TERMINATING`。 |
 | 安全模型 | socket 为本地 `0600` 文件，但没有认证、容器隔离、cgroup 或多用户授权。 |
 
 明确不在范围内的能力包括：TCP 远程访问、HTTP 或 Web UI、数据库、分布式 Agent、
@@ -283,8 +300,9 @@ cmake --build build --parallel
 | `job_test` | 参数校验、状态转移和终态 |
 | `job_scheduler_test` | FIFO 顺序、并发槽位、槽位释放和排队任务移除 |
 | `process_launcher_test` | `fork/execve`、管道、进程组和启动失败 |
-| `process_monitor_test` | 输出采集、结算、大输出、并发回收及取消后的尾部输出排空 |
-| `runnerd_integration_test` | 真实 daemon、FIFO 调度、排队与运行中取消、进程组终止及失败路径 |
+| `process_monitor_test` | 输出采集、结算、大输出、并发回收、终止竞争及取消后的尾部输出排空 |
+| `timeout_manager_test` | timerfd 标志、期限顺序、批量到期、generation 重排和惰性删除 |
+| `runnerd_integration_test` | 真实 daemon、FIFO 调度、取消、执行超时、进程组终止及失败路径 |
 
 ## 📚 文档
 
@@ -303,7 +321,8 @@ cmake --build build --parallel
 - [x] `STATUS` 与 `LIST` 查询
 - [x] FIFO 等待队列、`--max-running`、终态槽位释放与队列自动推进
 - [x] `CANCEL` 协议、排队取消与运行中任务的进程组 `SIGTERM`
-- [ ] `SIGKILL` 强制升级、执行超时、有界输出和输出查询
+- [x] 基于最小堆和 `timerfd` 的执行超时及 `TIMED_OUT` 结算
+- [ ] `SIGKILL` 强制升级、有界输出和输出查询
 - [ ] 任务历史持久化与重启恢复
 - [ ] 更多失败路径的集成测试、Sanitizer 检查和诊断报告
 

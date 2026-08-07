@@ -24,7 +24,7 @@ and reaps the resulting child processes.
 > [!WARNING]
 > **Experimental software.** `runnerd` is intended for a trusted, single-user
 > Linux environment. It has no authentication, sandboxing, persistence,
-> enforced execution timeout, or output-size limit. Do not expose it to
+> or output-size limit. Do not expose it to
 > untrusted users or workloads.
 
 ## ✨ Why runnerd?
@@ -41,6 +41,7 @@ purpose scheduler or remote execution platform.
 | Process supervision | Jobs use `fork/execve` and a separate process group; no shell is involved. |
 | Bounded concurrency | `--max-running` configures execution slots; excess jobs enter a FIFO waiting queue. |
 | Job cancellation | Queued jobs are removed directly; running jobs receive process-group `SIGTERM` and settle after their output is drained. |
+| Execution timeouts | One `timerfd` and a min-heap manage all running deadlines; expired jobs receive process-group `SIGTERM`. |
 | Observable lifecycle | `signalfd + waitpid` and non-blocking stdout/stderr pipes drive a documented job state machine. |
 | Tested behavior | GoogleTest and CTest cover protocol, state transitions, process launch, monitoring, and end-to-end flows. |
 
@@ -81,7 +82,7 @@ Use a second terminal to check the connection, submit a job, and inspect it:
 ./build/runnerctl ping
 # PONG
 
-./build/runnerctl submit -- /bin/sleep 10
+./build/runnerctl submit --timeout 1000 -- /bin/sleep 10
 # 1
 
 ./build/runnerctl status 1
@@ -113,6 +114,9 @@ the job's `argv`. The executable (`argv[0]`) must be an absolute path.
 - `runnerctl cancel <job_id>` directly cancels `QUEUED` jobs. For `RUNNING`
   jobs, the daemon sends `SIGTERM` to the entire process group and marks the job
   `CANCELLED` after the child exits and all output is drained.
+- `--timeout <ms>` starts when a job enters `RUNNING`; time spent in the FIFO
+  queue is excluded. An expired job enters `TERMINATING` and settles as
+  `TIMED_OUT` after process exit and output drain.
 - There is no grace-period `SIGKILL` escalation yet; a job that ignores
   `SIGTERM` remains `TERMINATING`.
 
@@ -132,6 +136,8 @@ flowchart TB
         Jobs[("In-memory job table<br/>state · metadata · captured output")]
         Scheduler["JobScheduler<br/>FIFO queue · execution slots"]
         Monitor["ProcessMonitor"]
+        Timeout["TimeoutManager<br/>min-heap · lazy deletion"]
+        Timer["timerfd<br/>CLOCK_MONOTONIC"]
         Launcher["process_launcher<br/>fork / execve · process group"]
         Signal["signalfd<br/>SIGCHLD"]
         Pipes[/"Non-blocking pipes<br/>stdout · stderr · startup error"/]
@@ -148,6 +154,12 @@ flowchart TB
         Jobs -->|"cancel queued job"| Scheduler
         Jobs -->|"terminate running job"| Monitor
         Scheduler -->|"grant start slot"| Monitor --> Launcher
+        Monitor -->|"RUNNING · register deadline"| Timeout
+        Timeout -->|"arm nearest deadline"| Timer
+        Timer -->|"expiration event"| Loop
+        Loop -->|"read expired jobs"| Timeout
+        Timeout -->|"request timeout termination"| Monitor
+        Monitor -->|"terminal · invalidate deadline"| Timeout
         Pipes -->|"output / startup-error event"| Loop
         Signal -->|"child-exit event"| Loop
         Loop -->|"dispatch fd / signal event"| Monitor
@@ -172,6 +184,11 @@ which the daemon starts the FIFO head of the waiting queue.
 To cancel a running job, `ProcessMonitor` sends `SIGTERM` to the negative
 process-group ID, continues draining stdout/stderr, and finally settles the job
 from `TERMINATING` to `CANCELLED` according to its termination cause.
+Only after a job enters `RUNNING` does the daemon register its optional deadline
+with `TimeoutManager`. The manager uses a min-heap and generation-based lazy
+deletion for all deadlines while arming a single `timerfd` for the nearest one.
+Expired jobs reuse the same process-group termination path and settle as
+`TIMED_OUT`.
 
 ## 🧩 Project Structure
 
@@ -183,6 +200,7 @@ from `TERMINATING` to `CANCELLED` according to its termination cause.
 | `src/job_scheduler.cpp` | FIFO waiting order, maximum execution slots, and queued-job removal. |
 | `src/process_launcher.cpp` | Pipes, `fork/execve`, standard-stream redirection, and process-group setup. |
 | `src/process_monitor.cpp` | `epoll` registration, output collection, `SIGCHLD` handling, and job settlement. |
+| `src/timeout_manager.cpp` | A min-heap and one `timerfd` for execution deadlines. |
 | `src/runnerd_main.cpp` | Daemon entry point and event loop. |
 | `src/runnerctl_main.cpp` | Command-line client and user-visible output. |
 | `tests/` | Unit tests and end-to-end tests against a real daemon. |
@@ -216,13 +234,15 @@ launch it becomes `RUNNING`. A child that exits with code `0` reaches
 `SUCCEEDED`; startup failures, non-zero exits, and signal termination result in
 `FAILED`. A resource-creation or registration failure before launch may also
 take a job directly from `QUEUED` to `FAILED`; cancelling a job before launch
-takes it from `QUEUED` to `CANCELLED`. Cancelling a running job first moves it
-to `TERMINATING`; it reaches `CANCELLED` after process exit and output drain.
+takes it from `QUEUED` to `CANCELLED`. Cancellation or execution timeout first
+moves a running job to `TERMINATING`; after process exit and output drain it
+reaches `CANCELLED` or `TIMED_OUT`, depending on the termination cause.
 
 ```text
 QUEUED ──> RUNNING ──> SUCCEEDED
    │          ├──────> FAILED
-   │          └──────> TERMINATING ──> CANCELLED
+   │          └──────> TERMINATING ──┬──> CANCELLED
+   │                                 └──> TIMED_OUT
    ├─────────────────> FAILED
    └─────────────────> CANCELLED
 ```
@@ -254,11 +274,11 @@ limitations are current behavior, not hidden trade-offs:
 
 | Area | Current behavior |
 | --- | --- |
-| Timeouts | `--timeout` is validated and stored in `JobSpec`, but does not terminate jobs yet. |
+| Timeouts | `--timeout` starts when a job enters `RUNNING`, excluding queue time. One `timerfd` manages all deadlines; expiration sends process-group `SIGTERM` and eventually settles the job as `TIMED_OUT`. |
 | Scheduling | `--max-running` limits concurrent execution; excess jobs remain `QUEUED` in FIFO order, and settlement automatically releases a slot and starts the queue head. |
 | Job data | Job metadata and captured output exist only in memory and are lost after restart. |
 | Output | stdout/stderr are captured, but cannot yet be queried through `runnerctl`; no size limit is applied. |
-| Control | `QUEUED` jobs are cancelled directly; `RUNNING` jobs enter `TERMINATING` through process-group `SIGTERM` and become `CANCELLED` after output drain. There is no `SIGKILL` escalation yet, so signal-ignoring jobs remain `TERMINATING`. |
+| Control | `QUEUED` jobs are cancelled directly. Running cancellation and execution timeout both enter `TERMINATING` through process-group `SIGTERM`, then settle according to their cause after output drain. There is no `SIGKILL` escalation yet, so signal-ignoring jobs remain `TERMINATING`. |
 | Security model | The socket is local and mode `0600`, but there is no authentication, container isolation, cgroup, or multi-user authorization. |
 
 Out of scope: remote TCP access, HTTP or Web UI, databases, distributed
@@ -302,8 +322,9 @@ The project requires C++17 and disables compiler extensions. Every target uses
 | `job_test` | Validation, state transitions, and terminal states |
 | `job_scheduler_test` | FIFO order, execution slots, slot release, and queued-job removal |
 | `process_launcher_test` | `fork/execve`, pipes, process groups, and startup failures |
-| `process_monitor_test` | Output capture, settlement, large output, concurrent reaping, and post-cancel output drain |
-| `runnerd_integration_test` | A real daemon, FIFO scheduling, queued and running cancellation, process-group termination, and failure paths |
+| `process_monitor_test` | Output capture, settlement, large output, concurrent reaping, termination races, and post-cancel output drain |
+| `timeout_manager_test` | timerfd flags, deadline ordering, batch expiration, generation replacement, and lazy deletion |
+| `runnerd_integration_test` | A real daemon, FIFO scheduling, cancellation, execution timeouts, process-group termination, and failure paths |
 
 ## 📚 Documentation
 
@@ -322,7 +343,8 @@ The project requires C++17 and disables compiler extensions. Every target uses
 - [x] `STATUS` and `LIST` queries
 - [x] FIFO waiting queue, `--max-running`, terminal slot release, and automatic queue advancement
 - [x] `CANCEL` protocol, queued cancellation, and process-group `SIGTERM` for running jobs
-- [ ] Forced `SIGKILL` escalation, enforced timeouts, bounded output, and output retrieval
+- [x] Min-heap and `timerfd` execution timeouts with `TIMED_OUT` settlement
+- [ ] Forced `SIGKILL` escalation, bounded output, and output retrieval
 - [ ] Persistent job history and restart recovery
 - [ ] More failure-path integration tests, Sanitizer checks, and diagnostics
 

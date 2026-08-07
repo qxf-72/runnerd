@@ -5,7 +5,8 @@
 状态为 `QUEUED` 的任务并加入 `JobScheduler`。获得运行槽位的任务由
 `ProcessMonitor` 启动，并根据子进程结果迁移到 `RUNNING`、`SUCCEEDED`
 或 `FAILED`；没有空闲槽位的任务继续保持 `QUEUED`，并可以通过 `CANCEL`
-请求从等待队列移除后进入 `CANCELLED`。
+请求从等待队列移除后进入 `CANCELLED`。运行中任务可以因用户取消或执行超时
+进入 `TERMINATING`，最后根据终止原因结算为 `CANCELLED` 或 `TIMED_OUT`。
 
 ## 状态说明
 
@@ -79,7 +80,9 @@ TERMINATING -> INTERRUPTED
 
 `transitionJob` 只负责校验并更新 `Job::state`。`ProcessMonitor` 负责填写
 PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排队取消不会启动
-进程，也不经过 `ProcessMonitor`；运行中取消与超时接入后再填写终止原因。
+进程，也不经过 `ProcessMonitor`；运行中取消或超时会由 `ProcessMonitor`
+发送进程组 `SIGTERM` 并填写终止原因。`TimeoutManager` 使用最小堆、generation
+惰性删除和单个 `timerfd` 管理全部运行任务的执行期限，但不直接修改任务状态。
 
 ## 当前运行时行为
 
@@ -93,8 +96,17 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排�
 - `runnerctl cancel <job_id>` 可以把 `QUEUED` 任务从 FIFO 等待队列移除，
   再执行 `QUEUED -> CANCELLED`；取消队列中间任务不会改变其他任务的顺序。
 - 不存在、已进入终态或正在终止的任务不能取消；重复取消会返回错误。
-- `RUNNING` 任务的取消目前会被明确拒绝，不发送信号，也不会进入
-  `TERMINATING`。运行中取消和超时终止流程尚未实现。
+- 取消 `RUNNING` 任务时，`ProcessMonitor` 向整个进程组发送 `SIGTERM`，任务执行
+  `RUNNING -> TERMINATING`；直接子进程退出且三个管道 EOF 后，再执行
+  `TERMINATING -> CANCELLED`。
+- 配置 `execution_timeout` 的任务只在成功进入 `RUNNING` 后登记 deadline，FIFO
+  排队时间不计入执行时间。期限到达后复用进程组终止流程，并在完成结算后执行
+  `TERMINATING -> TIMED_OUT`。
+- 自然退出、取消和超时发生竞争时，由第一个成功改变任务状态的事件决定结果。
+  `ProcessMonitor` 在发送终止信号前还会检查尚未处理的自然退出，避免把已经完成的
+  任务错误结算为 `CANCELLED` 或 `TIMED_OUT`。
+- 当前只发送 `SIGTERM`，没有宽限期后的 `SIGKILL` 升级；忽略信号的任务会保持
+  `TERMINATING`。
 - 客户端断开后任务仍然执行并保留。
 - 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
   退出、信号终止或启动失败时进入 `FAILED`。
@@ -115,7 +127,8 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排�
 - 全部终态和非终态的判断
 
 `tests/process_monitor_test.cpp` 还覆盖成功执行、stdout/stderr 采集、
-execve 失败、非零退出、大输出排空和多个子进程同时回收。
+execve 失败、非零退出、大输出排空、多个子进程同时回收、运行中取消后的尾部输出，
+以及“子进程已经自然退出但 SIGCHLD 尚未处理”时不能错误覆盖终态的竞争场景。
 
 `tests/job_scheduler_test.cpp` 覆盖非法最大并发数、FIFO 启动顺序、并发槽位、
 终态任务释放槽位、排队任务移除和重复调度保护。
@@ -123,11 +136,16 @@ execve 失败、非零退出、大输出排空和多个子进程同时回收。
 `tests/protocol_test.cpp` 覆盖 CANCEL 的 8 字节大端 JobId 往返，以及零 JobId、
 错误前缀、截断和尾随字节等畸形请求。
 
+`tests/timeout_manager_test.cpp` 覆盖 timerfd 的非阻塞与 `CLOEXEC` 标志、期限顺序、
+一次唤醒返回全部到期任务、相同 JobId 的 generation 重排、惰性删除和幂等取消。
+
 `tests/runnerd_integration_test.cpp` 通过真实 daemon 和 runnerctl 覆盖成功
 任务与失败任务的 STATUS 查询、非零退出码、stdout/stderr 字节数、LIST
 顺序、不存在的 JobId、非法 STATUS/LIST 参数，以及 `--max-running` 为 `1`
 或 `2` 时的并发限制和非法并发参数。还覆盖成功退出、非零退出及 `execve`
 失败后的队列自动推进、FIFO 启动顺序，以及多个任务快速退出时槽位不会泄漏
 或重复释放。CANCEL 测试还覆盖命令行参数校验、排队任务取消、STATUS/LIST
-中的 `CANCELLED`、取消队列中间任务后的 FIFO 推进，以及不存在、运行中、
-已终态和重复取消的错误响应。
+中的 `CANCELLED`、取消队列中间任务后的 FIFO 推进、运行中进程组终止，以及
+不存在、已终态和重复取消的错误响应。超时测试覆盖 `TIMED_OUT` 结算、超时后
+释放槽位、排队时间不计入执行期限、自然完成后的旧 deadline 失效，以及无超时
+任务不受其他任务的 timerfd 事件影响。
