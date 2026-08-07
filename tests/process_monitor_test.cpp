@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <sys/epoll.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -59,6 +60,33 @@ bool waitForPath(const std::string& path) {
 
     if (errno != ENOENT) {
       throw std::system_error(errno, std::generic_category(), "access temporary marker");
+    }
+
+    ::usleep(10'000);
+  }
+
+  return false;
+}
+
+bool waitForExitedChild(pid_t pid) {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    siginfo_t child_info{};
+
+    // WNOWAIT 只观察退出状态，不真正回收子进程。
+    // 这样可以稳定构造“子进程已经退出，但 ProcessMonitor 尚未处理 SIGCHLD”的场景。
+    if (::waitid(P_PID, static_cast<id_t>(pid), &child_info,
+                 WEXITED | WNOHANG | WNOWAIT) == -1) {
+      const int error_number = errno;
+
+      if (error_number == EINTR) {
+        continue;
+      }
+
+      throw std::system_error(error_number, std::generic_category(), "waitid child exit");
+    }
+
+    if (child_info.si_pid == pid) {
+      return true;
     }
 
     ::usleep(10'000);
@@ -330,6 +358,30 @@ TEST(ProcessMonitorTest, CancelsRunningJobAfterDrainingRemainingOutput) {
   EXPECT_NE(cancelled_job.standard_error.find("errhead"), std::string::npos);
   EXPECT_NE(cancelled_job.standard_error.find("errtail"), std::string::npos);
   EXPECT_TRUE(cancelled_job.failure_message.empty());
+}
+
+TEST(ProcessMonitorTest, PreservesNaturalExitBeforeTerminationRequest) {
+  ProcessMonitorHarness harness;
+  harness.addJob(1, {"/bin/true"});
+
+  harness.startJob(1);
+
+  const runnerd::Job& running_job = harness.job(1);
+  ASSERT_TRUE(running_job.pid.has_value());
+  ASSERT_TRUE(waitForExitedChild(*running_job.pid));
+
+  // 此时子进程已经退出，但测试还没有处理 signalfd 和 pipe 事件。
+  // 终止请求必须识别自然退出，不能把任务错误地改成 TIMED_OUT。
+  EXPECT_FALSE(harness.requestTerminate(1, runnerd::TerminationCause::kTimedOut));
+
+  harness.waitForJob(1);
+
+  const runnerd::Job& completed_job = harness.job(1);
+  EXPECT_EQ(completed_job.state, runnerd::JobState::kSucceeded);
+  ASSERT_TRUE(completed_job.exit_code.has_value());
+  EXPECT_EQ(*completed_job.exit_code, 0);
+  EXPECT_FALSE(completed_job.exit_signal.has_value());
+  EXPECT_FALSE(completed_job.termination_cause.has_value());
 }
 
 }  // namespace

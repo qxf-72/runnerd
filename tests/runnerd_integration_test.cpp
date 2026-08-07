@@ -778,6 +778,104 @@ TEST_F(RunnerdIntegrationTest, CancelsRunningProcessGroupAndStartsNextQueuedJob)
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
+TEST_F(RunnerdIntegrationTest, TimesOutRunningJobAndStartsNextQueuedJob) {
+  const ChildResult first_submit =
+      runClient({"submit", "--timeout", "1000", "--", "/bin/sleep", "30"});
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/true"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(first_submit.standard_output, "1\n");
+  ASSERT_EQ(second_submit.standard_output, "2\n");
+
+  const ChildResult queued_status = runClient({"status", "2"});
+  ASSERT_EQ(queued_status.exit_code, 0) << queued_status.standard_error;
+  ASSERT_NE(queued_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << queued_status.standard_output;
+
+  const ChildResult timed_out_status = waitForJobState("1", "TIMED_OUT");
+  ASSERT_EQ(timed_out_status.exit_code, 0)
+      << timed_out_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(timed_out_status.standard_output.find("timeout_ms=1000"), std::string::npos)
+      << timed_out_status.standard_output;
+  EXPECT_NE(timed_out_status.standard_output.find("exit_signal=15"), std::string::npos)
+      << timed_out_status.standard_output;
+
+  // 超时任务完成结算后必须归还唯一的运行槽位。
+  const ChildResult second_status = waitForJobState("2", "SUCCEEDED");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=SUCCEEDED"), std::string::npos)
+      << second_status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, QueuedTimeDoesNotConsumeExecutionTimeout) {
+  const std::string release_file = makeTemporaryFilePath("release-first-job");
+
+  // Job 1 一直占用槽位，直到测试创建 release_file。
+  // 这样不需要猜测一个固定 sleep 是否足以覆盖繁忙的 CI 环境。
+  const ChildResult first_submit =
+      runClient({"submit", "--", "/bin/sh", "-c",
+                 "while [ ! -e \"$1\" ]; do sleep 0.01; done",
+                 "runnerd-integration-test", release_file});
+  const ChildResult second_submit =
+      runClient({"submit", "--timeout", "150", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+
+  // Job 2 在队列里等待的时间超过它自己的 150 ms execution timeout。
+  // 如果 timeout 从 SUBMIT 开始计算，此时它已经会被错误地判定为超时。
+  ::usleep(250'000);
+
+  const ChildResult still_queued = runClient({"status", "2"});
+  ASSERT_EQ(still_queued.exit_code, 0) << still_queued.standard_error;
+  ASSERT_NE(still_queued.standard_output.find("state=QUEUED"), std::string::npos)
+      << still_queued.standard_output << "\nserver log:\n"
+      << readServerLog();
+
+  std::ofstream release_output(release_file);
+  ASSERT_TRUE(release_output.good());
+  release_output << "release\n";
+  release_output.close();
+
+  const ChildResult first_status = waitForJobState("1", "SUCCEEDED");
+  ASSERT_EQ(first_status.exit_code, 0)
+      << first_status.standard_error << "\nserver log:\n" << readServerLog();
+
+  // Job 2 真正进入 RUNNING 后，才开始计算自己的 150 ms。
+  const ChildResult second_status = waitForJobState("2", "TIMED_OUT");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("timeout_ms=150"), std::string::npos)
+      << second_status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, CompletedJobIsNotAffectedByStaleDeadline) {
+  const ChildResult submit =
+      runClient({"submit", "--timeout", "300", "--", "/bin/true"});
+
+  ASSERT_EQ(submit.exit_code, 0) << submit.standard_error;
+  ASSERT_EQ(submit.standard_output, "1\n");
+
+  const ChildResult completed_status = waitForJobState("1", "SUCCEEDED");
+  ASSERT_EQ(completed_status.exit_code, 0)
+      << completed_status.standard_error << "\nserver log:\n" << readServerLog();
+
+  // 等待原 deadline 到达，验证终态时留下的旧堆节点不会再次影响任务。
+  ::usleep(400'000);
+
+  const ChildResult status_after_deadline = runClient({"status", "1"});
+  ASSERT_EQ(status_after_deadline.exit_code, 0) << status_after_deadline.standard_error;
+  EXPECT_NE(status_after_deadline.standard_output.find("state=SUCCEEDED"), std::string::npos)
+      << status_after_deadline.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_EQ(status_after_deadline.standard_output.find("state=TIMED_OUT"), std::string::npos);
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
 // 这个派生 Fixture 与基础 Fixture 唯一的不同：
 // 启动 daemon 时传入 --max-running 2。
 class RunnerdMaxTwoIntegrationTest : public RunnerdIntegrationTest {
@@ -817,6 +915,33 @@ TEST_F(RunnerdMaxTwoIntegrationTest, StartsFirstTwoJobsAndQueuesThirdWhenMaximum
   EXPECT_NE(third_status.standard_output.find("state=QUEUED"), std::string::npos)
       << third_status.standard_output;
 
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdMaxTwoIntegrationTest, UntimedJobIsNotAffectedByAnotherJobsTimeout) {
+  const ChildResult timed_submit =
+      runClient({"submit", "--timeout", "1000", "--", "/bin/sleep", "30"});
+  const ChildResult untimed_submit = runClient({"submit", "--", "/bin/sleep", "30"});
+
+  ASSERT_EQ(timed_submit.exit_code, 0) << timed_submit.standard_error;
+  ASSERT_EQ(untimed_submit.exit_code, 0) << untimed_submit.standard_error;
+
+  const ChildResult untimed_running = runClient({"status", "2"});
+  ASSERT_EQ(untimed_running.exit_code, 0) << untimed_running.standard_error;
+  ASSERT_NE(untimed_running.standard_output.find("state=RUNNING"), std::string::npos)
+      << untimed_running.standard_output << "\nserver log:\n"
+      << readServerLog();
+
+  const ChildResult timed_status = waitForJobState("1", "TIMED_OUT");
+  ASSERT_EQ(timed_status.exit_code, 0)
+      << timed_status.standard_error << "\nserver log:\n" << readServerLog();
+
+  const ChildResult untimed_status = runClient({"status", "2"});
+  ASSERT_EQ(untimed_status.exit_code, 0) << untimed_status.standard_error;
+  EXPECT_NE(untimed_status.standard_output.find("state=RUNNING"), std::string::npos)
+      << untimed_status.standard_output << "\nserver log:\n"
+      << readServerLog();
+  EXPECT_EQ(untimed_status.standard_output.find("timeout_ms="), std::string::npos);
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 

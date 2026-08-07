@@ -369,4 +369,24 @@ if(BUILD_TESTING)
     )
 
     gtest_discover_tests(job_scheduler_test)
+
+    add_executable(timeout_manager_test
+        tests/timeout_manager_test.cpp
+    )
+
+    target_link_libraries(timeout_manager_test PRIVATE
+        runnerd_timeout
+        GTest::gtest_main
+    )
+
+    target_compile_options(timeout_manager_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+
+    gtest_discover_tests(
+        timeout_manager_test
+        PROPERTIES TIMEOUT 5
+    )
 endif()
