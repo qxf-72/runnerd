@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `QUEUED` | 否 | 任务已经创建，正在等待启动 |
 | `RUNNING` | 否 | 子进程已经启动，任务正在执行 |
-| `TERMINATING` | 否 | 已经请求终止，正在等待子进程真正退出 |
+| `TERMINATING` | 否 | 已发送 `SIGTERM`，正在等待宽限期退出或 `SIGKILL` 强制终止 |
 | `SUCCEEDED` | 是 | 任务执行成功 |
 | `FAILED` | 是 | 任务启动失败或执行失败 |
 | `CANCELLED` | 是 | 任务因用户主动取消而结束 |
@@ -62,6 +62,8 @@ TERMINATING -> INTERRUPTED
   请求终止子进程并进入 `TERMINATING`，等待子进程退出后再确定最终状态。
 - `TerminationCause` 记录进入 `TERMINATING` 的原因，目前分为用户取消和
   执行超时。
+- 任务进入 `TERMINATING` 后获得固定的 1 秒宽限期；宽限期到达时仍未完成，
+  runnerd 会向整个进程组发送 `SIGKILL`，但不会覆盖最初的 `TerminationCause`。
 - 超时从任务进入 `RUNNING` 时开始计算，不包含排队时间。
 - `SUCCEEDED`、`FAILED`、`CANCELLED`、`TIMED_OUT` 和 `INTERRUPTED`
   都是终态，不能再迁移到其他状态。
@@ -81,8 +83,9 @@ TERMINATING -> INTERRUPTED
 `transitionJob` 只负责校验并更新 `Job::state`。`ProcessMonitor` 负责填写
 PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排队取消不会启动
 进程，也不经过 `ProcessMonitor`；运行中取消或超时会由 `ProcessMonitor`
-发送进程组 `SIGTERM` 并填写终止原因。`TimeoutManager` 使用最小堆、generation
-惰性删除和单个 `timerfd` 管理全部运行任务的执行期限，但不直接修改任务状态。
+发送进程组 `SIGTERM` 并填写终止原因，必要时再升级为进程组 `SIGKILL`。
+`TimeoutManager` 使用最小堆、generation 惰性删除和单个 `timerfd`，同时管理
+`RUNNING` 任务的执行期限和 `TERMINATING` 任务的强杀期限，但不直接修改任务状态。
 
 ## 当前运行时行为
 
@@ -97,16 +100,16 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排�
   再执行 `QUEUED -> CANCELLED`；取消队列中间任务不会改变其他任务的顺序。
 - 不存在、已进入终态或正在终止的任务不能取消；重复取消会返回错误。
 - 取消 `RUNNING` 任务时，`ProcessMonitor` 向整个进程组发送 `SIGTERM`，任务执行
-  `RUNNING -> TERMINATING`；直接子进程退出且三个管道 EOF 后，再执行
+  `RUNNING -> TERMINATING` 并登记 1 秒强杀期限；宽限期内完成时直接结算，
+  否则向进程组发送 `SIGKILL`。直接子进程退出且三个管道 EOF 后，再执行
   `TERMINATING -> CANCELLED`。
 - 配置 `execution_timeout` 的任务只在成功进入 `RUNNING` 后登记 deadline，FIFO
-  排队时间不计入执行时间。期限到达后复用进程组终止流程，并在完成结算后执行
-  `TERMINATING -> TIMED_OUT`。
+  排队时间不计入执行时间。期限到达后发送进程组 `SIGTERM` 并登记 1 秒强杀期限；
+  必要时升级为 `SIGKILL`，完成结算后执行 `TERMINATING -> TIMED_OUT`。
 - 自然退出、取消和超时发生竞争时，由第一个成功改变任务状态的事件决定结果。
   `ProcessMonitor` 在发送终止信号前还会检查尚未处理的自然退出，避免把已经完成的
-  任务错误结算为 `CANCELLED` 或 `TIMED_OUT`。
-- 当前只发送 `SIGTERM`，没有宽限期后的 `SIGKILL` 升级；忽略信号的任务会保持
-  `TERMINATING`。
+  任务错误结算为 `CANCELLED` 或 `TIMED_OUT`。任务一旦进入 `TERMINATING`，
+  后续取消或超时事件不能覆盖第一次记录的终止原因。
 - 客户端断开后任务仍然执行并保留。
 - 任务启动成功后进入 `RUNNING`；退出码为 0 时进入 `SUCCEEDED`，非零
   退出、信号终止或启动失败时进入 `FAILED`。
@@ -128,7 +131,8 @@ PID、进程组、stdout/stderr、退出码、退出信号和失败信息。排�
 
 `tests/process_monitor_test.cpp` 还覆盖成功执行、stdout/stderr 采集、
 execve 失败、非零退出、大输出排空、多个子进程同时回收、运行中取消后的尾部输出，
-以及“子进程已经自然退出但 SIGCHLD 尚未处理”时不能错误覆盖终态的竞争场景。
+“子进程已经自然退出但 SIGCHLD 尚未处理”时不能错误覆盖终态的竞争场景，以及
+强杀状态约束、宽限期内退出和忽略 `SIGTERM` 后的 `SIGKILL` 升级。
 
 `tests/job_scheduler_test.cpp` 覆盖非法最大并发数、FIFO 启动顺序、并发槽位、
 终态任务释放槽位、排队任务移除和重复调度保护。
@@ -148,4 +152,5 @@ execve 失败、非零退出、大输出排空、多个子进程同时回收、�
 中的 `CANCELLED`、取消队列中间任务后的 FIFO 推进、运行中进程组终止，以及
 不存在、已终态和重复取消的错误响应。超时测试覆盖 `TIMED_OUT` 结算、超时后
 释放槽位、排队时间不计入执行期限、自然完成后的旧 deadline 失效，以及无超时
-任务不受其他任务的 timerfd 事件影响。
+任务不受其他任务的 timerfd 事件影响。两阶段终止测试还覆盖宽限期内优雅退出、
+忽略 `SIGTERM` 后强杀、强杀后的队列推进，以及取消与超时竞争时第一次原因获胜。

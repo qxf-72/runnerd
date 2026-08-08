@@ -24,9 +24,10 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 结算。任务最终结算后，daemon 会释放运行槽位并自动启动 FIFO 队首。
 `status` 可以查询单个任务，`list` 会按 JobId 顺序列出内存中的任务。
 
-运行中取消和执行超时都会向整个任务进程组发送 `SIGTERM`，并在直接子进程退出、
-三个输出管道 EOF 后，根据终止原因结算为 `CANCELLED` 或 `TIMED_OUT`。当前尚无
-宽限期后的 `SIGKILL` 升级；daemon 重启后内存任务、输出及 JobId 计数都会丢失。
+运行中取消和执行超时都会先向整个任务进程组发送 `SIGTERM`。任务如果没有在固定的
+1 秒宽限期内退出，daemon 会再向进程组发送 `SIGKILL`。直接子进程退出且三个输出
+管道 EOF 后，任务根据最初的终止原因结算为 `CANCELLED` 或 `TIMED_OUT`。
+daemon 重启后，内存任务、输出及 JobId 计数都会丢失。
 
 ## 第一阶段核心功能
 
@@ -54,7 +55,7 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - [x] 从 FIFO 等待队列取消尚未启动的任务
 - [x] 运行中任务的进程组 `SIGTERM` 终止
 - [x] 基于最小堆和单个 `timerfd` 的执行超时
-- [ ] 宽限期后的进程组 `SIGKILL` 强制终止
+- [x] 固定宽限期后的进程组 `SIGKILL` 强制终止
 - [ ] 任务历史持久化
 - [ ] runnerd 重启后的任务状态恢复
 
@@ -71,6 +72,7 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 - [x] CANCEL 协议、命令行校验和排队取消集成测试
 - [x] 运行中取消、进程组终止和自然退出竞争测试
 - [x] TimeoutManager 单元测试和真实 daemon 超时集成测试
+- [x] 宽限期退出、`SIGKILL` 升级、槽位释放及取消/超时竞争测试
 - [ ] 持久化与重启恢复测试
 
 ## 当前 daemon 启动参数
@@ -114,18 +116,20 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
 ## 当前超时行为
 
 - `TimeoutManager` 使用 `CLOCK_MONOTONIC`、一个非阻塞且带 `CLOEXEC` 的
-  `timerfd`，以及一个最小堆管理所有运行任务的 deadline。
+  `timerfd`，以及一个最小堆管理所有任务期限。
+- `RUNNING` 任务的期限表示 execution deadline；`TERMINATING` 任务的期限表示
+  SIGKILL deadline。同一个 JobId 同一时刻只保留一个有效期限。
 - timerfd 始终设置为最近的有效 deadline。相同 JobId 重新登记期限时使用
-  generation 使旧堆节点失效；任务自然结束或被取消后使用惰性删除使期限失效。
-- timerfd 可读时会一次取出当前所有已经到期的有效 JobId。daemon 再次确认任务
-  仍为 `RUNNING`，随后向整个进程组发送 `SIGTERM`，执行
-  `RUNNING -> TERMINATING` 并记录 `TerminationCause::kTimedOut`。
+  generation 使旧堆节点失效；任务自然结束或取消期限时使用惰性删除。
+- execution deadline 到达时，daemon 向整个进程组发送 `SIGTERM`，执行
+  `RUNNING -> TERMINATING`，记录 `TerminationCause::kTimedOut`，并登记 1 秒后的
+  SIGKILL deadline。
+- 如果任务在宽限期内退出，则不发送 `SIGKILL`；如果宽限期到达时任务仍未完成，
+  daemon 会向整个进程组发送 `SIGKILL`，同时保留原来的状态和终止原因。
 - 只有直接子进程已经退出，stdout、stderr 和 startup-error 三个管道全部 EOF 后，
   任务才从 `TERMINATING` 结算为 `TIMED_OUT`，然后释放运行槽位并启动 FIFO 队首。
 - 自然退出与 deadline 同时到达时，`ProcessMonitor` 会在发送信号前使用非阻塞
   `waitpid` 检查真实退出结果，避免把已经完成的任务错误标记为 `TIMED_OUT`。
-- 当前没有宽限期后的 `SIGKILL` 升级。忽略 `SIGTERM` 的超时任务会保持
-  `TERMINATING`，这是下一阶段要解决的限制。
 
 ## 当前 CANCEL 行为
 
@@ -137,16 +141,18 @@ runnerd 是一个面向同一用户、本机运行的任务执行守护服务。
   该任务，再执行 `QUEUED -> CANCELLED`，避免任务进入终态后仍被启动。服务端
   返回 `OK cancelled`，客户端输出 `Cancelled job <job_id>`。
 - `RUNNING` 任务取消时，`ProcessMonitor` 向负进程组 ID 发送 `SIGTERM`，执行
-  `RUNNING -> TERMINATING` 并记录 `TerminationCause::kCancelled`。三个管道 EOF
-  且直接子进程退出后，任务结算为 `CANCELLED`。服务端返回 `OK terminating`，
+  `RUNNING -> TERMINATING` 并记录 `TerminationCause::kCancelled`，同时用 1 秒后的
+  SIGKILL deadline 替换原 execution deadline。服务端返回 `OK terminating`，
   客户端输出 `Cancellation requested for job <job_id>`。
-- 运行中取消成功后，对应执行期限会立即失效，不能再把任务改成 `TIMED_OUT`。
+- 任务在宽限期内退出时不发送 `SIGKILL`；否则宽限期结束后强制终止整个进程组。
+  三个管道 EOF 且直接子进程退出后，任务结算为 `CANCELLED`。
+- 运行中取消成功后，原执行期限会立即失效，后续不能再把任务改成 `TIMED_OUT`。
 - 任务不存在、已经进入终态或正在终止时，取消请求会返回错误且不改变状态。
   重复取消当前也返回“任务已是终态”，因此该接口不是幂等成功接口。
 - 如果直接子进程在取消信号发送前已经自然退出，`ProcessMonitor` 会保留真实退出
   结果，不会把任务错误标记为 `CANCELLED`。
-- 当前没有宽限期后的 `SIGKILL` 升级。忽略 `SIGTERM` 的任务会保持
-  `TERMINATING`。
+- 取消、超时和自然退出发生竞争时，第一个成功改变任务状态的事件决定结果；进入
+  `TERMINATING` 后，后续请求不能覆盖已经记录的 `TerminationCause`。
 
 ## 当前查询行为
 
