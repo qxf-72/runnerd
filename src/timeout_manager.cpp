@@ -92,10 +92,10 @@ void TimeoutManager::schedule(JobId job_id, JobTimeout timeout) {
 
   const std::uint64_t generation = next_generation_++;
 
-  // execution_timeout 从此刻开始计算。
+  // deadline 从此刻开始计算。
   //
-  // pumpScheduler 只有在 startJob() 成功将任务变成 RUNNING 后，
-  // 才会调用这个函数，因此排队时间不会被计算在内。
+  // 当前既可用于 RUNNING 任务的 execution timeout，
+  // 也可用于 TERMINATING 任务的 SIGKILL 宽限期。
   const TimePoint deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(timeout);
 
   const DeadlineEntry entry{

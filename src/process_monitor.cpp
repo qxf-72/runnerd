@@ -290,100 +290,128 @@ void ProcessMonitor::startJob(JobId job_id) {
   std::cout << "started job " << job_id << " with pid " << process.pid << '\n';
 }
 
-bool ProcessMonitor::requestTerminate(JobId job_id, TerminationCause cause) {
-  Job& job = jobs_.at(job_id);
-
-  if (job.state != JobState::kRunning) {
-    throw std::logic_error("only RUNNING jobs can be terminated");
-  }
-
+bool ProcessMonitor::finishExitedChildBeforeSignal(JobId job_id) {
   auto active_it = active_jobs_.find(job_id);
 
   if (active_it == active_jobs_.end()) {
-    throw std::logic_error("running job has no active process");
+    throw std::logic_error("job has no active process before signal");
   }
 
-  // 子进程可能已经自然退出并成为僵尸进程，只是事件循环还没有处理 SIGCHLD。
-  // 此时向进程组发送信号仍可能成功，所以不能只依靠 kill() 的 ESRCH 判断。
-  //
-  // 先使用 WNOHANG 检查一次直接子进程。如果已经退出，就保存真实 waitpid 结果，
-  // 并主动排空三个非阻塞管道，尽可能在发送 SIGTERM 前完成自然结算。
-  ActiveProcess& current_process = active_it->second;
+  ActiveProcess& process = active_it->second;
 
-  if (!current_process.child_exited) {
+  // 子进程可能已经退出并成为僵尸进程，
+  // 只是 signalfd 事件尚未被主循环处理。
+  //
+  // 此时只检查 kill() 是否成功并不可靠：
+  // 僵尸进程的 PID 仍然存在，kill() 的行为不能替代 waitpid()。
+  //
+  // 所以在发送 SIGTERM 或 SIGKILL 前，先主动检查一次直接子进程。
+  if (!process.child_exited) {
     for (;;) {
       int wait_status = 0;
-      const pid_t wait_result = ::waitpid(current_process.pid, &wait_status, WNOHANG);
 
-      if (wait_result == current_process.pid) {
-        current_process.child_exited = true;
-        current_process.wait_status = wait_status;
+      const pid_t wait_result = ::waitpid(process.pid, &wait_status, WNOHANG);
+
+      if (wait_result == process.pid) {
+        // 直接子进程已经退出。
+        // 保存 waitpid 状态，后面由 tryFinalizeJob() 统一解释。
+        process.child_exited = true;
+        process.wait_status = wait_status;
         break;
       }
 
       if (wait_result == 0) {
+        // 子进程仍在运行，可以继续发送信号。
         break;
       }
 
       const int error_number = errno;
 
       if (error_number == EINTR) {
+        // waitpid 被信号中断，重新调用。
         continue;
       }
 
       if (error_number == ECHILD) {
-        throw std::logic_error("running job child was reaped without being recorded");
+        // 该 PID 应该始终由 ProcessMonitor 回收。
+        // 出现 ECHILD 表示内部回收状态不一致。
+        throw std::logic_error("active child was reaped without being recorded");
       }
 
       throw std::system_error(error_number, std::generic_category(),
-                              "check child before sending SIGTERM");
+                              "check child before sending signal");
     }
   }
 
-  if (current_process.child_exited) {
-    // drainProcessFd() 可能关闭 fd，因此先复制当前的三个描述符。
-    const std::array<int, 3> process_fds{
-        current_process.stdout_fd,
-        current_process.stderr_fd,
-        current_process.startup_error_fd,
-    };
+  if (!process.child_exited) {
+    // 子进程仍在运行，还不能最终结算。
+    return false;
+  }
 
-    for (const int fd : process_fds) {
-      if (fd != -1) {
-        drainProcessFd(fd);
-      }
-    }
+  // 子进程已经退出，但 stdout/stderr/startup-error pipe
+  // 中可能仍然有最后一批数据。
+  //
+  // drainProcessFd() 可能在读到 EOF 后关闭 fd，
+  // 因此先复制三个 fd，避免后续访问被修改的字段。
+  const std::array<int, 3> process_fds{
+      process.stdout_fd,
+      process.stderr_fd,
+      process.startup_error_fd,
+  };
 
-    tryFinalizeJob(job_id);
-
-    if (isTerminal(job.state)) {
-      // 子进程及其输出都已经自然结束，不能再把任务改成
-      // CANCELLED 或 TIMED_OUT。
-      return false;
-    }
-
-    // 直接子进程虽然已经退出，但后代进程仍可能持有输出管道。
-    // 这种情况下任务尚未完成，继续终止剩余进程组。
-    active_it = active_jobs_.find(job_id);
-
-    if (active_it == active_jobs_.end()) {
-      throw std::logic_error("non-terminal job has no active process");
+  for (const int fd : process_fds) {
+    if (fd != -1) {
+      drainProcessFd(fd);
     }
   }
 
-  ActiveProcess& process = active_it->second;
+  // 只有 child_exited 和三条 pipe EOF 全部成立，
+  // tryFinalizeJob() 才会真正修改为终态。
+  tryFinalizeJob(job_id);
+
+  const Job& job = jobs_.at(job_id);
+
+  if (isTerminal(job.state)) {
+    // 任务已经按照真实退出结果完成。
+    // 调用者不应该再发送 SIGTERM 或 SIGKILL。
+    return true;
+  }
+
+  // 直接子进程虽然已经退出，但可能仍有后代进程持有 pipe。
+  //
+  // 例如：
+  //   /bin/sh -c "sleep 100 & exit 0"
+  //
+  // 此时直接 shell 已退出，但 sleep 仍属于原进程组并持有 pipe。
+  // 任务还不能最终结算，仍需要向整个进程组发送信号。
+  return false;
+}
+
+bool ProcessMonitor::sendSignalToProcessGroup(JobId job_id, int signal_number,
+                                              const char* operation) {
+  const auto active_it = active_jobs_.find(job_id);
+
+  if (active_it == active_jobs_.end()) {
+    throw std::logic_error("job has no active process for signal");
+  }
+
+  const ActiveProcess& process = active_it->second;
 
   if (process.process_group_id <= 0) {
-    throw std::logic_error("running job has an invalid process group id");
+    throw std::logic_error("job has an invalid process group id");
   }
 
-  //   kill(-pgid, SIGTERM)
-  //       → 向整个进程组发送 SIGTERM
+  // 负的进程组 ID 表示：
   //
-  // 这样 /bin/sh 创建的后台子进程、孙进程也会一起收到信号。
+  //   向 process_group_id 对应进程组中的所有进程发送信号。
+  //
+  // 不能只执行：
+  //   kill(process.pid, signal_number)
+  //
+  // 否则 shell 创建的子进程和孙进程可能继续运行。
   for (;;) {
-    if (::kill(-process.process_group_id, SIGTERM) == 0) {
-      break;
+    if (::kill(-process.process_group_id, signal_number) == 0) {
+      return true;
     }
 
     const int error_number = errno;
@@ -393,22 +421,96 @@ bool ProcessMonitor::requestTerminate(JobId job_id, TerminationCause cause) {
     }
 
     if (error_number == ESRCH) {
-      // 进程可能在上面的 waitpid 检查之后、kill 调用之前退出。
+      // 进程组可能刚好在 waitpid 检查与 kill 之间消失。
       //
-      // 不允许此时擅自把 Job 改成 CANCELLED；
-      // 后续 waitpid 会根据真实退出结果结算。
+      // 这里不擅自修改 JobState。
+      // 后续 SIGCHLD 和 pipe EOF 仍然负责真实结算。
       return false;
     }
 
-    throw std::system_error(error_number, std::generic_category(),
-                            "send SIGTERM to job process group");
+    throw std::system_error(error_number, std::generic_category(), operation);
+  }
+}
+
+bool ProcessMonitor::requestTerminate(JobId job_id, TerminationCause cause) {
+  Job& job = jobs_.at(job_id);
+
+  if (job.state != JobState::kRunning) {
+    // 状态检查保证同一个任务不会重复发送 SIGTERM。
+    //
+    // 第一次请求成功后，任务立即进入 TERMINATING，
+    // 后续取消或超时请求就不能再次进入这里。
+    throw std::logic_error("only RUNNING jobs can be terminated");
   }
 
+  if (finishExitedChildBeforeSignal(job_id)) {
+    // 子进程在终止请求前已经自然结束，
+    // 任务已经按照真实 waitpid 结果结算。
+    return false;
+  }
+
+  if (!sendSignalToProcessGroup(job_id, SIGTERM, "send SIGTERM to job process group")) {
+    // 进程组在检查和发送信号之间消失。
+    // 不修改状态，等待真实退出事件。
+    return false;
+  }
+
+  // 只有 SIGTERM 确实发送成功后，才修改 Job 状态。
+  //
+  // 这样如果 kill() 失败，Job 不会错误地停留在 TERMINATING。
   transitionJob(job, JobState::kTerminating);
+
   job.termination_cause = cause;
 
-  std::cout << "requested termination of job " << job_id << " for process group "
-            << process.process_group_id << '\n';
+  std::cout << "requested graceful termination of job " << job_id << '\n';
+
+  return true;
+}
+
+bool ProcessMonitor::forceKill(JobId job_id) {
+  Job& job = jobs_.at(job_id);
+
+  if (job.state != JobState::kTerminating) {
+    // 只有已经成功发送过 SIGTERM 的任务才允许升级为 SIGKILL。
+    //
+    // 这个状态检查阻止：
+    // - 对 RUNNING 任务跳过 SIGTERM 直接强杀；
+    // - 对已经进入终态的任务发送 SIGKILL。
+    //
+    // 正常事件循环通过 TimeoutManager 的 generation 和单次期限机制
+    // 保证同一个强杀期限只处理一次；这里的状态检查本身并不能阻止
+    // 外部代码对仍处于 TERMINATING 的任务重复调用 forceKill()。
+    throw std::logic_error("only TERMINATING jobs can be force killed");
+  }
+
+  if (!job.termination_cause.has_value()) {
+    throw std::logic_error("terminating job has no termination cause");
+  }
+
+  if (finishExitedChildBeforeSignal(job_id)) {
+    // 任务已经在宽限期内退出并完成结算。
+    // 不再发送 SIGKILL。
+    return false;
+  }
+
+  if (!sendSignalToProcessGroup(job_id, SIGKILL, "send SIGKILL to job process group")) {
+    // 进程组已经消失。
+    // 等待 SIGCHLD 和 pipe EOF 完成最终结算。
+    return false;
+  }
+
+  // forceKill 不修改 JobState 和 termination_cause。
+  //
+  // 状态仍然是 TERMINATING，
+  // 原因仍然是第一次成功进入 TERMINATING 时记录的原因。
+  //
+  // 后续 waitpid 可能记录：
+  //   exit_signal = SIGKILL
+  //
+  // 但最终业务状态仍然是：
+  //   kCancelled -> CANCELLED
+  //   kTimedOut  -> TIMED_OUT
+  std::cout << "sent SIGKILL to process group of job " << job_id << '\n';
 
   return true;
 }

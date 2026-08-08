@@ -26,11 +26,18 @@ class ProcessMonitor {
   // 启动失败会把 Job 标记为 FAILED，而不是让 daemon 退出。
   void startJob(JobId job_id);
 
-  // 请求终止一个正在运行的任务。
-  //
-  // 返回 true 表示已经向进程组发送 SIGTERM，任务进入 TERMINATING。
-  // 返回 false 表示直接子进程在信号发送前已经退出，任务会按照真实退出结果结算。
+  // 第一阶段：发送 SIGTERM，并让 RUNNING -> TERMINATING。
+  // 返回 true 表示信号发送成功；返回 false 表示发送前任务已经完成结算，
+  // 或者进程组已经消失，此时不会修改为 TERMINATING。
   bool requestTerminate(JobId job_id, TerminationCause cause);
+
+  // 第二阶段：宽限期结束后发送 SIGKILL。
+  //
+  // 如果进程组仍然存在，只发送信号，不改变 TERMINATING 状态和
+  // termination_cause；如果发送信号前发现任务已经退出，则可能
+  // 按照已有的退出结果直接完成终态结算。
+  // 返回 true 表示 SIGKILL 发送成功，返回 false 表示无需或无法继续发送。
+  bool forceKill(JobId job_id);
 
   bool ownsFileDescriptor(int fd) const;
 
@@ -108,6 +115,21 @@ class ProcessMonitor {
 
   void failQueuedJob(Job& job, const std::string& message);
   void abandonStartedJob(JobId job_id, const std::string& message);
+
+  // 在发送信号前使用 waitpid(WNOHANG) 检查直接子进程是否已经退出。
+  //
+  // 如果子进程已经退出，还会主动排空三条非阻塞管道并尝试最终结算。
+  //
+  // 返回 true：任务已经进入终态，不应该再发送信号。
+  // 返回 false：任务仍未完成，可以继续向进程组发送信号。
+  bool finishExitedChildBeforeSignal(JobId job_id);
+
+  // 向任务的整个进程组发送指定信号。
+  //
+  // 返回 true：信号发送成功。
+  // 返回 false：kill() 返回 ESRCH，进程组已不存在。
+  // 其他错误抛出 std::system_error。
+  bool sendSignalToProcessGroup(JobId job_id, int signal_number, const char* operation);
 };
 
 }  // namespace runnerd

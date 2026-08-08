@@ -28,6 +28,7 @@
 namespace {
 
 constexpr const char* kDefaultSocketPath = "/tmp/runnerd.sock";
+constexpr runnerd::JobTimeout kTerminationGracePeriod{1000};
 
 // daemon 自己的启动参数。
 // 以后若加入 --data-dir，也继续放在这里，而不是散落在 main() 中。
@@ -150,6 +151,47 @@ using Connections = std::unordered_map<int, Connection>;
 
 // 任务属于 daemon，而不是某一条客户端连接。
 using Jobs = runnerd::JobTable;
+
+// 为已经进入 TERMINATING 的任务登记强杀期限。
+//
+// 调用这个函数之前必须保证：
+//
+// - SIGTERM 已成功发送；
+// - JobState 已经是 TERMINATING；
+// - termination_cause 已经设置。
+//
+// 同一个 JobId 同一时刻只保留一个有效 deadline：
+//
+// RUNNING
+//     execution deadline
+//
+// TERMINATING
+//     force-kill deadline
+void scheduleForceKillDeadline(runnerd::JobId job_id, runnerd::TimeoutManager& timeout_manager,
+                               runnerd::ProcessMonitor& process_monitor) {
+  // 手动取消时，原 execution deadline 可能仍然有效。
+  // 先让旧期限失效。
+  //
+  // 如果当前处理的本来就是 execution deadline，
+  // handleReadable() 已经将它移除，再 cancel 一次也没有影响。
+  timeout_manager.cancel(job_id);
+
+  try {
+    timeout_manager.schedule(job_id, kTerminationGracePeriod);
+
+    std::cout << "scheduled SIGKILL deadline for job " << job_id << ": "
+              << kTerminationGracePeriod.count() << " ms\n";
+  } catch (const std::exception& exception) {
+    // 如果无法登记强杀期限，不能让任务永远停在
+    // TERMINATING，所以采用保守降级策略：立即发送 SIGKILL。
+    timeout_manager.cancel(job_id);
+
+    std::cerr << "failed to schedule SIGKILL deadline for job " << job_id << ": "
+              << exception.what() << "; escalating immediately\n";
+
+    static_cast<void>(process_monitor.forceKill(job_id));
+  }
+}
 
 // 尽可能多地启动等待任务，直到：
 // 1. 等待队列为空；或
@@ -456,24 +498,37 @@ std::string cancelJob(runnerd::JobId job_id, Jobs& jobs, runnerd::JobScheduler& 
   }
 
   if (job.state == runnerd::JobState::kRunning) {
-    try {
-      const bool requested =
-          process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kCancelled);
+    bool requested = false;
 
-      if (!requested) {
-        // ProcessMonitor 在发送 SIGTERM 前发现进程已经自然退出。
-        // 此时任务会按照真实 waitpid 结果结算，不能改成 CANCELLED。
-        return "ERR job process already exited; retry status";
-      }
-      timeout_manager.cancel(job_id);
-      return "OK terminating";
+    try {
+      requested = process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kCancelled);
     } catch (const std::system_error& exception) {
-      // 保持 Job 为 RUNNING，不改变 termination_cause，
-      // 让客户端获得可读错误，而不是关闭连接或让 daemon 崩溃。
+      // SIGTERM 发送失败时，requestTerminate 不会修改状态。
+      //
+      // Job 仍然保持 RUNNING，
+      // 原 execution deadline 也继续有效。
       std::cerr << "failed to terminate job " << job_id << ": " << exception.what() << '\n';
 
       return std::string("ERR failed to send SIGTERM: ") + exception.code().message();
     }
+
+    if (!requested) {
+      // 发送 SIGTERM 前发现子进程已经自然结束。
+      //
+      // 不能把它标记为 CANCELLED，
+      // 也不需要登记 SIGKILL 期限。
+      return "ERR job process already exited; retry status";
+    }
+
+    // requestTerminate 成功后：
+    //
+    // RUNNING -> TERMINATING
+    // termination_cause = kCancelled
+    //
+    // 从现在开始等待固定宽限期。
+    scheduleForceKillDeadline(job_id, timeout_manager, process_monitor);
+
+    return "OK terminating";
   }
 
   if (job.state == runnerd::JobState::kTerminating) {
@@ -640,71 +695,109 @@ bool handleClientRead(int client_fd, Connection& connection, Jobs& jobs,
   }
 }
 
-// 处理一次 timerfd 事件。
+// 处理一次 timerfd deadline 事件。
 //
-// TimeoutManager 只返回已经到期的 JobId。
-// daemon 再调用 ProcessMonitor 请求终止对应进程。
-void handleTimeoutEvent(std::uint32_t event_mask, Jobs& jobs,
-                        runnerd::TimeoutManager& timeout_manager,
-                        runnerd::ProcessMonitor& process_monitor) {
+// 同一个 TimeoutManager 管理两种期限：
+//
+// RUNNING：
+//   execution deadline 到期，发送 SIGTERM，原因记为 kTimedOut。
+//
+// TERMINATING：
+//   grace deadline 到期，发送 SIGKILL，不改变最初原因。
+void handleDeadlineEvent(std::uint32_t event_mask, Jobs& jobs,
+                         runnerd::TimeoutManager& timeout_manager,
+                         runnerd::ProcessMonitor& process_monitor) {
   if ((event_mask & (EPOLLERR | EPOLLHUP)) != 0) {
-    // timerfd 出现错误意味着 daemon 已无法可靠执行超时策略。
     throw std::runtime_error("timerfd reported EPOLLERR or EPOLLHUP");
   }
 
+  // handleReadable() 会一次返回当前所有已经到期的有效 JobId。
+  //
+  // 对应的 heap 节点和 active generation 已经被移除，
+  // 因此每个期限只会被处理一次。
   const std::vector<runnerd::JobId> expired_jobs = timeout_manager.handleReadable();
 
   for (const runnerd::JobId job_id : expired_jobs) {
     const auto job_it = jobs.find(job_id);
 
     if (job_it == jobs.end()) {
-      // TimeoutManager 中的 JobId 必须来自 JobTable。
-      throw std::logic_error("timeout refers to an unknown job");
+      throw std::logic_error("deadline refers to an unknown job");
     }
 
     runnerd::Job& job = job_it->second;
 
-    if (job.state != runnerd::JobState::kRunning) {
-      // 正常情况下：
+    if (job.state == runnerd::JobState::kRunning) {
+      // RUNNING 状态下的期限一定是 execution deadline。
       //
-      // - 自然终态会调用 timeout_manager.cancel()；
-      // - 手动取消成功也会调用 timeout_manager.cancel()。
+      // 到期后先发送 SIGTERM，
+      // 不允许直接跳过优雅终止阶段发送 SIGKILL。
+      const bool requested =
+          process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kTimedOut);
+
+      if (!requested) {
+        // ProcessMonitor 在发送 SIGTERM 前发现任务已经自然结束。
+        //
+        // 这种情况按照真实 waitpid 结果结算，
+        // 不标记为 TIMED_OUT，也不登记强杀期限。
+        std::cout << "job " << job_id
+                  << " reached its execution deadline, "
+                     "but had already exited\n";
+
+        continue;
+      }
+
+      std::cout << "execution timeout reached for job " << job_id << "; SIGTERM sent\n";
+
+      // SIGTERM 发送成功后，为该任务登记强杀期限。
       //
-      // 这里保留防御性检查，避免对非 RUNNING 任务再次发信号。
-      std::cerr << "ignored timeout for job " << job_id << " because its state is "
-                << runnerd::jobStateName(job.state) << '\n';
+      // 此时 Job 已经是 TERMINATING，
+      // 所以下次同一 JobId 到期时会进入下面的 forceKill 分支。
+      scheduleForceKillDeadline(job_id, timeout_manager, process_monitor);
 
       continue;
     }
 
-    // 复用第 4 天已经实现的进程组终止逻辑。
-    //
-    // 成功后：
-    //   RUNNING -> TERMINATING
-    //   termination_cause = kTimedOut
-    //
-    // 最终仍要等待：
-    //   child_exited
-    //   stdout_eof
-    //   stderr_eof
-    //   startup_error_eof
-    //
-    // 全部成立后，ProcessMonitor 才会结算为 TIMED_OUT。
-    const bool requested =
-        process_monitor.requestTerminate(job_id, runnerd::TerminationCause::kTimedOut);
+    if (job.state == runnerd::JobState::kTerminating) {
+      // TERMINATING 状态下的期限一定是 grace deadline。
+      //
+      // termination_cause 可能是：
+      //   kCancelled
+      //   kTimedOut
+      //
+      // forceKill 不改变原因，只发送 SIGKILL。
+      const bool signal_sent = process_monitor.forceKill(job_id);
 
-    if (!requested) {
-      // ProcessMonitor 在发送 SIGTERM 前发现进程已经自然退出，
-      // 并按照真实 waitpid 结果进行结算。
-      // 这种情况下不能再把任务标记为 TIMED_OUT。
-      std::cout << "job " << job_id
-                << " reached its deadline, but the process "
-                   "had already exited\n";
+      if (signal_sent) {
+        std::cout << "termination grace period expired for job " << job_id << "; SIGKILL sent\n";
+      } else {
+        std::cout << "termination grace period expired for job " << job_id
+                  << ", but the process group had already exited\n";
+      }
+
+      // 不再登记第三个期限。
+      //
+      // SIGKILL 不可捕获、不可忽略。
+      // 后续只需要等待 SIGCHLD 和三个 pipe EOF。
+      continue;
+    }
+
+    if (runnerd::isTerminal(job.state)) {
+      // 正常情况下，终态通知会调用 timeout_manager.cancel()，
+      // 因此终态任务不应该作为有效期限返回。
+      //
+      // 保留防御性处理，避免对终态任务发送任何信号。
+      std::cerr << "ignored deadline for terminal job " << job_id << '\n';
 
       continue;
     }
 
-    std::cout << "execution timeout reached for job " << job_id << '\n';
+    if (job.state == runnerd::JobState::kQueued) {
+      // QUEUED 任务不会登记 execution deadline。
+      // 出现这种情况表示模块之间的不变量被破坏。
+      throw std::logic_error("queued job unexpectedly has an active deadline");
+    }
+
+    throw std::logic_error("unknown job state while handling deadline");
   }
 }
 
@@ -797,9 +890,20 @@ int main(int argc, char* argv[]) {
           continue;
         }
 
-        // timerfd 到期也是普通的 epoll 事件。
         if (fd == timeout_manager.fileDescriptor()) {
-          handleTimeoutEvent(event_mask, jobs, timeout_manager, process_monitor);
+          handleDeadlineEvent(event_mask, jobs, timeout_manager, process_monitor);
+
+          // requestTerminate() 或 forceKill() 在发送信号前会主动
+          // waitpid(WNOHANG)、排空 pipe，并可能直接完成最终结算。
+          //
+          // 如果发生了最终结算，ProcessMonitor 回调已经把 JobId
+          // 放进 terminal_job_notifications。
+          //
+          // 这里立即处理通知，避免必须等待下一个 signalfd 事件后
+          // 才归还调度槽位。
+          processTerminalJobNotifications(jobs, scheduler, process_monitor, timeout_manager,
+                                          terminal_job_notifications);
+
           continue;
         }
 

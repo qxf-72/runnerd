@@ -11,22 +11,32 @@
 
 namespace runnerd {
 
-// TimeoutManager 只负责执行超时的“时间管理”。
+// TimeoutManager 负责 daemon 中所有与任务有关的单次期限。
 //
-// 它负责：
-// 1. 记录某个 JobId 的执行截止时间；
-// 2. 使用一个最小堆找到最近的截止时间；
-// 3. 使用一个 timerfd 通知 epoll；
-// 4. timerfd 到期后返回所有已经过期的 JobId。
+// 当前有两类期限：
 //
-// 它不负责：
-// 1. 不修改 JobState；
-// 2. 不发送 SIGTERM；
-// 3. 不回收子进程；
-// 4. 不管理调度槽位。
+// 1. Job 为 RUNNING 时：
+//    记录 execution deadline。
+//    到期后 daemon 发送 SIGTERM，并让任务进入 TERMINATING。
 //
-// 到期任务应该如何终止，由 daemon 调用
-// ProcessMonitor::requestTerminate() 决定。
+// 2. Job 为 TERMINATING 时：
+//    记录 force-kill deadline。
+//    到期后 daemon 发送 SIGKILL。
+//
+// 同一个 JobId 同一时刻只保留一个有效期限。
+// schedule() 为 JobId 分配新 generation，旧期限会通过惰性删除失效。
+//
+// TimeoutManager 只负责：
+// 1. 保存 deadline；
+// 2. 找到最近的 deadline；
+// 3. 维护 timerfd；
+// 4. 返回已经到期的 JobId。
+//
+// TimeoutManager 不负责：
+// 1. 不读取或修改 JobState；
+// 2. 不发送 SIGTERM 或 SIGKILL；
+// 3. 不决定任务最终是 CANCELLED 还是 TIMED_OUT；
+// 4. 不回收子进程。
 class TimeoutManager {
  public:
   // 创建一个基于 CLOCK_MONOTONIC 的 timerfd，
@@ -44,13 +54,15 @@ class TimeoutManager {
   // 当前 epoll 事件是否属于 TimeoutManager。
   int fileDescriptor() const noexcept;
 
-  // 从“现在”开始，为任务设置执行超时。
+  // 从“现在”开始，为 JobId 设置一个单次期限。
   //
-  // 这个函数只能在任务成功进入 RUNNING 后调用。
-  // 因此排队等待时间不会计入 execution_timeout。
+  // 当前调用场景包括：
   //
-  // 如果相同 JobId 再次被 schedule，新的期限会替代旧期限。
-  // 旧的堆记录会通过 generation 被识别为失效记录。
+  // - RUNNING 任务的 execution timeout；
+  // - TERMINATING 任务的 SIGKILL 宽限期。
+  //
+  // 如果相同 JobId 已经存在有效期限，新期限会使用新的 generation
+  // 替代旧期限。旧堆节点会在到达堆顶时被惰性删除。
   void schedule(JobId job_id, JobTimeout timeout);
 
   // 取消一个任务尚未触发的超时期限。
