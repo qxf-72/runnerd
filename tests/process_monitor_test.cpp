@@ -1,6 +1,7 @@
 #include "runnerd/process_monitor.h"
 
 #include <gtest/gtest.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -143,6 +144,10 @@ class ProcessMonitorHarness {
 
   bool requestTerminate(runnerd::JobId job_id, runnerd::TerminationCause cause) {
     return monitor_->requestTerminate(job_id, cause);
+  }
+
+  bool forceKill(runnerd::JobId job_id) {
+    return monitor_->forceKill(job_id);
   }
 
   const runnerd::Job& job(runnerd::JobId job_id) const {
@@ -382,6 +387,99 @@ TEST(ProcessMonitorTest, PreservesNaturalExitBeforeTerminationRequest) {
   EXPECT_EQ(*completed_job.exit_code, 0);
   EXPECT_FALSE(completed_job.exit_signal.has_value());
   EXPECT_FALSE(completed_job.termination_cause.has_value());
+}
+
+TEST(ProcessMonitorTest, RejectsForceKillOutsideTerminatingState) {
+  ProcessMonitorHarness harness;
+  harness.addJob(1, {"/bin/sleep", "30"});
+
+  harness.startJob(1);
+
+  // RUNNING 任务必须先经过 requestTerminate() 发送 SIGTERM，
+  // 不能跳过优雅终止阶段直接强杀。
+  EXPECT_THROW(harness.forceKill(1), std::logic_error);
+
+  ASSERT_TRUE(harness.requestTerminate(1, runnerd::TerminationCause::kCancelled));
+  harness.waitForJob(1);
+
+  EXPECT_EQ(harness.job(1).state, runnerd::JobState::kCancelled);
+
+  // 终态任务同样不能再次收到 SIGKILL。
+  EXPECT_THROW(harness.forceKill(1), std::logic_error);
+}
+
+TEST(ProcessMonitorTest, SkipsForceKillWhenJobExitsDuringGracePeriod) {
+  ProcessMonitorHarness harness;
+  TemporaryPath ready_marker;
+
+  // handler 在 SIGTERM 到达后正常退出，模拟任务在宽限期内完成清理。
+  harness.addJob(1, {
+                        "/bin/sh",
+                        "-c",
+                        "trap 'printf graceful; exit 0' TERM; : > \"$1\"; "
+                        "while :; do sleep 30; done",
+                        "runnerd-process-monitor-test",
+                        ready_marker.get(),
+                    });
+
+  harness.startJob(1);
+  ASSERT_TRUE(waitForPath(ready_marker.get()));
+
+  const runnerd::Job& running_job = harness.job(1);
+  ASSERT_TRUE(running_job.pid.has_value());
+  const pid_t child_pid = *running_job.pid;
+
+  ASSERT_TRUE(harness.requestTerminate(1, runnerd::TerminationCause::kTimedOut));
+  ASSERT_TRUE(waitForExitedChild(child_pid));
+
+  // forceKill() 会先观察真实退出结果并排空管道。
+  // 任务已经在宽限期内退出，因此不应该发送 SIGKILL。
+  EXPECT_FALSE(harness.forceKill(1));
+
+  const runnerd::Job& timed_out_job = harness.job(1);
+  EXPECT_EQ(timed_out_job.state, runnerd::JobState::kTimedOut);
+  ASSERT_TRUE(timed_out_job.termination_cause.has_value());
+  EXPECT_EQ(*timed_out_job.termination_cause, runnerd::TerminationCause::kTimedOut);
+  ASSERT_TRUE(timed_out_job.exit_code.has_value());
+  EXPECT_EQ(*timed_out_job.exit_code, 0);
+  EXPECT_FALSE(timed_out_job.exit_signal.has_value());
+  EXPECT_EQ(timed_out_job.standard_output, "graceful");
+}
+
+TEST(ProcessMonitorTest, ForceKillsSignalIgnoringJobAndPreservesTerminationCause) {
+  ProcessMonitorHarness harness;
+  TemporaryPath ready_marker;
+
+  // shell 和它随后启动的 sleep 都继承“忽略 SIGTERM”的 disposition，
+  // 因此任务只有在第二阶段收到进程组 SIGKILL 后才会退出。
+  harness.addJob(1, {
+                        "/bin/sh",
+                        "-c",
+                        "trap '' TERM; : > \"$1\"; while :; do sleep 30; done",
+                        "runnerd-process-monitor-test",
+                        ready_marker.get(),
+                    });
+
+  harness.startJob(1);
+  ASSERT_TRUE(waitForPath(ready_marker.get()));
+
+  ASSERT_TRUE(harness.requestTerminate(1, runnerd::TerminationCause::kTimedOut));
+
+  const runnerd::Job& terminating_job = harness.job(1);
+  ASSERT_EQ(terminating_job.state, runnerd::JobState::kTerminating);
+  ASSERT_TRUE(terminating_job.termination_cause.has_value());
+  EXPECT_EQ(*terminating_job.termination_cause, runnerd::TerminationCause::kTimedOut);
+
+  ASSERT_TRUE(harness.forceKill(1));
+  harness.waitForJob(1);
+
+  const runnerd::Job& timed_out_job = harness.job(1);
+  EXPECT_EQ(timed_out_job.state, runnerd::JobState::kTimedOut);
+  ASSERT_TRUE(timed_out_job.termination_cause.has_value());
+  EXPECT_EQ(*timed_out_job.termination_cause, runnerd::TerminationCause::kTimedOut);
+  EXPECT_FALSE(timed_out_job.exit_code.has_value());
+  ASSERT_TRUE(timed_out_job.exit_signal.has_value());
+  EXPECT_EQ(*timed_out_job.exit_signal, SIGKILL);
 }
 
 }  // namespace

@@ -810,6 +810,124 @@ TEST_F(RunnerdIntegrationTest, TimesOutRunningJobAndStartsNextQueuedJob) {
   EXPECT_TRUE(serverIsRunning()) << readServerLog();
 }
 
+TEST_F(RunnerdIntegrationTest, LetsTimedOutJobExitDuringTerminationGracePeriod) {
+  const std::string ready_file = makeTemporaryFilePath("graceful-timeout.pid");
+
+  // 收到 SIGTERM 后输出一段可观察数据并以 0 退出。
+  // 如果 daemon 错误地提前发送 SIGKILL，就不会得到 exit_code=0 和这段输出。
+  const ChildResult submit =
+      runClient({"submit", "--timeout", "500", "--", "/bin/sh", "-c",
+                 "trap 'printf graceful; exit 0' TERM; echo $$ > \"$1\"; "
+                 "while :; do sleep 30; done",
+                 "runnerd-integration-test", ready_file});
+
+  ASSERT_EQ(submit.exit_code, 0) << submit.standard_error;
+  ASSERT_EQ(submit.standard_output, "1\n");
+  ASSERT_GT(waitForPidFile(ready_file), 0);
+
+  const ChildResult status = waitForJobState("1", "TIMED_OUT");
+  ASSERT_EQ(status.exit_code, 0)
+      << status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(status.standard_output.find("state=TIMED_OUT"), std::string::npos)
+      << status.standard_output;
+  EXPECT_NE(status.standard_output.find("exit_code=0"), std::string::npos)
+      << status.standard_output;
+  EXPECT_NE(status.standard_output.find("stdout_bytes=8"), std::string::npos)
+      << status.standard_output;
+  EXPECT_EQ(status.standard_output.find("exit_signal="), std::string::npos)
+      << status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, ForceKillsTimedOutJobAndStartsNextQueuedJob) {
+  const std::string ready_file = makeTemporaryFilePath("force-killed-timeout.pid");
+
+  const ChildResult first_submit =
+      runClient({"submit", "--timeout", "500", "--", "/bin/sh", "-c",
+                 "trap '' TERM; echo $$ > \"$1\"; while :; do sleep 30; done",
+                 "runnerd-integration-test", ready_file});
+
+  ASSERT_EQ(first_submit.exit_code, 0) << first_submit.standard_error;
+  ASSERT_EQ(first_submit.standard_output, "1\n");
+  ASSERT_GT(waitForPidFile(ready_file), 0);
+
+  const ChildResult second_submit = runClient({"submit", "--", "/bin/true"});
+  ASSERT_EQ(second_submit.exit_code, 0) << second_submit.standard_error;
+  ASSERT_EQ(second_submit.standard_output, "2\n");
+
+  const ChildResult queued_status = runClient({"status", "2"});
+  ASSERT_EQ(queued_status.exit_code, 0) << queued_status.standard_error;
+  ASSERT_NE(queued_status.standard_output.find("state=QUEUED"), std::string::npos)
+      << queued_status.standard_output;
+
+  // Job 1 忽略第一阶段 SIGTERM，必须在固定宽限期结束后被 SIGKILL。
+  const ChildResult timed_out_status = waitForJobState("1", "TIMED_OUT");
+  ASSERT_EQ(timed_out_status.exit_code, 0)
+      << timed_out_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(timed_out_status.standard_output.find("exit_signal=9"), std::string::npos)
+      << timed_out_status.standard_output;
+
+  // 强杀完成结算后必须释放唯一运行槽位，继续推进 FIFO 队列。
+  const ChildResult second_status = waitForJobState("2", "SUCCEEDED");
+  ASSERT_EQ(second_status.exit_code, 0)
+      << second_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(second_status.standard_output.find("state=SUCCEEDED"), std::string::npos)
+      << second_status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
+TEST_F(RunnerdIntegrationTest, PreservesFirstCauseWhenCancellationAndTimeoutCompete) {
+  const std::string cancel_first_ready = makeTemporaryFilePath("cancel-first.pid");
+
+  // execution timeout 留得足够长，确保取消请求先进入 TERMINATING。
+  const ChildResult cancel_first_submit =
+      runClient({"submit", "--timeout", "5000", "--", "/bin/sh", "-c",
+                 "trap '' TERM; echo $$ > \"$1\"; while :; do sleep 30; done",
+                 "runnerd-integration-test", cancel_first_ready});
+
+  ASSERT_EQ(cancel_first_submit.exit_code, 0) << cancel_first_submit.standard_error;
+  ASSERT_GT(waitForPidFile(cancel_first_ready), 0);
+
+  const ChildResult cancellation = runClient({"cancel", "1"});
+  ASSERT_EQ(cancellation.exit_code, 0) << cancellation.standard_error;
+
+  const ChildResult cancelled_status = waitForJobState("1", "CANCELLED");
+  ASSERT_EQ(cancelled_status.exit_code, 0)
+      << cancelled_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(cancelled_status.standard_output.find("exit_signal=9"), std::string::npos)
+      << cancelled_status.standard_output;
+  EXPECT_EQ(cancelled_status.standard_output.find("state=TIMED_OUT"), std::string::npos)
+      << cancelled_status.standard_output;
+
+  const std::string timeout_first_ready = makeTemporaryFilePath("timeout-first.pid");
+  const ChildResult timeout_first_submit =
+      runClient({"submit", "--timeout", "300", "--", "/bin/sh", "-c",
+                 "trap '' TERM; echo $$ > \"$1\"; while :; do sleep 30; done",
+                 "runnerd-integration-test", timeout_first_ready});
+
+  ASSERT_EQ(timeout_first_submit.exit_code, 0) << timeout_first_submit.standard_error;
+  ASSERT_GT(waitForPidFile(timeout_first_ready), 0);
+
+  // 先等超时处理把 Job 2 变为 TERMINATING，再发取消请求。
+  const ChildResult terminating_status = waitForJobState("2", "TERMINATING");
+  ASSERT_EQ(terminating_status.exit_code, 0)
+      << terminating_status.standard_error << "\nserver log:\n" << readServerLog();
+
+  const ChildResult late_cancellation = runClient({"cancel", "2"});
+  EXPECT_NE(late_cancellation.exit_code, 0);
+  EXPECT_NE(late_cancellation.standard_error.find("already terminating"), std::string::npos)
+      << late_cancellation.standard_error;
+
+  const ChildResult timed_out_status = waitForJobState("2", "TIMED_OUT");
+  ASSERT_EQ(timed_out_status.exit_code, 0)
+      << timed_out_status.standard_error << "\nserver log:\n" << readServerLog();
+  EXPECT_NE(timed_out_status.standard_output.find("exit_signal=9"), std::string::npos)
+      << timed_out_status.standard_output;
+  EXPECT_EQ(timed_out_status.standard_output.find("state=CANCELLED"), std::string::npos)
+      << timed_out_status.standard_output;
+  EXPECT_TRUE(serverIsRunning()) << readServerLog();
+}
+
 TEST_F(RunnerdIntegrationTest, QueuedTimeDoesNotConsumeExecutionTimeout) {
   const std::string release_file = makeTemporaryFilePath("release-first-job");
 
